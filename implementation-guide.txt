@@ -1,0 +1,82 @@
+# D-FINE-Mask Implementation Guide
+
+This guide explains how to implement instance segmentation capabilities in the D-FINE object detection framework by adding the D-FINE-Mask extension.
+
+## Files to Create/Modify
+
+Create the following new files:
+
+1. **src/zoo/dfine/dfine_mask.py** - Defines the DFINEMask model and MaskHead classes
+2. **src/zoo/dfine/dfine_mask_criterion.py** - Adds mask loss computation
+3. **src/zoo/dfine/dfine_mask_postprocessor.py** - Processes mask outputs
+4. **configs/dataset/coco_instance.yml** - COCO instance segmentation dataset configuration
+5. **configs/dfine/dfine_mask_hgnetv2_l_coco.yml** - Configuration for D-FINE-Mask
+
+Update the following existing file:
+
+- **src/zoo/dfine/__init__.py** - Add imports for the new mask-related classes
+
+## Implementation Details
+
+### 1. DFINEMask Model
+
+The `DFINEMask` class extends the basic `DFINE` architecture by adding a mask prediction head. The `MaskHead` class consists of convolutional layers that transform feature embeddings into binary masks for each detected object.
+
+Key features:
+- Works with the existing D-FINE encoder-decoder architecture
+- Adds minimal parameters while leveraging existing feature representations
+- Produces fixed-resolution masks (default: 28×28) for each detected object
+
+### 2. Loss Functions for Masks
+
+The `DFINEMaskCriterion` class extends `DFINECriterion` with:
+- Binary cross-entropy loss for mask prediction
+- Dice loss for better mask shape prediction
+- Weight parameters to balance mask losses with detection losses
+- Integration with the existing matcher to assign predictions to ground truth
+
+### 3. Mask Postprocessing
+
+The `DFINEMaskPostProcessor` extends `DFINEPostProcessor` to:
+- Process predicted masks alongside boxes and labels
+- Resize masks to the original image dimensions
+- Apply a threshold to produce binary masks
+- Include masks in the final output dictionaries
+
+### 4. Dataset Configuration
+
+The COCO instance segmentation dataset configuration adds:
+- Support for loading instance masks from COCO annotations
+- Proper evaluation with both bounding box and segmentation metrics
+
+### 5. Model Configuration
+
+The D-FINE-Mask configuration demonstrates how to:
+- Use the DFINEMask model instead of DFINE
+- Configure the mask head parameters
+- Set appropriate loss weights for mask prediction
+- Configure the mask threshold for postprocessing
+
+## Integration Steps
+
+1. Add the new files to the project structure
+2. Update the `__init__.py` file with the new imports
+3. Create the dataset and model configuration files
+4. Train the model using the standard D-FINE training pipeline:
+
+```bash
+python train.py -c configs/dfine/dfine_mask_hgnetv2_l_coco.yml
+```
+
+## Notes on Dataset Preparation
+
+For COCO instance segmentation, ensure:
+- The dataset loader extracts mask annotations (polygon or RLE format)
+- Masks are properly transformed alongside bounding boxes during data augmentation
+- The collate function handles the variable-sized mask tensors
+
+## Performance Considerations
+
+- The mask head adds approximately 0.5M parameters to the model
+- Mask prediction increases inference time by about 10-15%
+- Consider reducing mask resolution for faster inference (at the cost of mask quality)

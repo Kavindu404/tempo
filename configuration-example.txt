@@ -1,0 +1,93 @@
+__include__: [
+  '../dataset/coco_instance.yml',
+  '../runtime.yml',
+  './include/dataloader.yml',
+  './include/optimizer.yml',
+  './include/dfine_hgnetv2.yml',
+]
+
+output_dir: ./output/dfine_mask_hgnetv2_l_coco
+
+# Change model to DFINEMask
+model: DFINEMask
+# Change criterion to DFINEMaskCriterion
+criterion: DFINEMaskCriterion
+# Change postprocessor to DFINEMaskPostProcessor
+postprocessor: DFINEMaskPostProcessor
+
+use_focal_loss: True
+eval_spatial_size: [640, 640] # h w
+
+# DFINEMask configuration
+DFINEMask:
+  backbone: HGNetv2
+  encoder: HybridEncoder
+  decoder: DFINETransformer
+  mask_head: MaskHead
+  mask_dim: 256
+  mask_resolution: 28
+
+# MaskHead configuration
+MaskHead:
+  hidden_dim: 256
+  mask_dim: 256
+  num_convs: 4
+  mask_resolution: 28
+
+# Matcher with mask costs
+HungarianMatcher:
+  weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2}
+  use_focal_loss: True
+  alpha: 0.25
+  gamma: 2.0
+
+# Criterion with mask losses
+DFINEMaskCriterion:
+  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5, loss_mask: 1.0, loss_dice: 1.0}
+  losses: ['vfl', 'boxes', 'local', 'masks']
+  alpha: 0.75
+  gamma: 2.0
+  reg_max: 32
+  mask_weight: 1.0
+  dice_weight: 1.0
+
+# Postprocessor with mask threshold
+DFINEMaskPostProcessor:
+  num_classes: 80
+  use_focal_loss: True
+  num_top_queries: 300
+  mask_threshold: 0.5
+
+HGNetv2:
+  name: 'B4'
+  return_idx: [1, 2, 3]
+  freeze_stem_only: True
+  freeze_at: 0
+  freeze_norm: True
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      params: '^(?=.*backbone)(?!.*norm|bn).*$'
+      lr: 0.0000125
+    -
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+
+  lr: 0.00025
+  betas: [0.9, 0.999]
+  weight_decay: 0.000125
+
+
+# Training configuration
+epoches: 80 # 72 + 2n
+train_dataloader:
+  dataset:
+    transforms:
+      policy:
+        epoch: 72
+  collate_fn:
+    stop_epoch: 72
+    ema_restart_decay: 0.9999
+    base_size_repeat: 4

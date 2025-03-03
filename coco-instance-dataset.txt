@@ -1,0 +1,22 @@
+task: instance_segmentation
+
+evaluator:
+  type: CocoEvaluator
+  iou_types: ['bbox', 'segm']
+
+train_dataloader:
+  dataset:
+    type: CocoDetection
+    data_root: data/coco
+    ann_file: annotations/instances_train2017.json
+    img_prefix: train2017
+    filter_empty_gt: True
+    instance_segmentation: True
+
+val_dataloader:
+  dataset:
+    type: CocoDetection
+    data_root: data/coco
+    ann_file: annotations/instances_val2017.json
+    img_prefix: val2017
+    instance_segmentation: True
