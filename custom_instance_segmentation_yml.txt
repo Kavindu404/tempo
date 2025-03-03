@@ -1,0 +1,41 @@
+task: instance_segmentation
+
+evaluator:
+  type: CocoEvaluator
+  iou_types: ['bbox', 'segm']  # Added 'segm' for mask evaluation
+
+num_classes: 80  # Adjust to your dataset's number of classes
+remap_mscoco_category: False
+
+train_dataloader:
+  type: DataLoader
+  dataset:
+    type: CocoDetection
+    img_folder: /path/to/your/train/images
+    ann_file: /path/to/your/train/annotations.json
+    return_masks: True  # Important: set to True to load segmentation masks
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: True
+  num_workers: 4
+  drop_last: True
+  collate_fn:
+    type: BatchImageCollateFunction
+
+
+val_dataloader:
+  type: DataLoader
+  dataset:
+    type: CocoDetection
+    img_folder: /path/to/your/val/images
+    ann_file: /path/to/your/val/annotations.json
+    return_masks: True  # Important: set to True to load segmentation masks
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: False
+  num_workers: 4
+  drop_last: False
+  collate_fn:
+    type: BatchImageCollateFunction

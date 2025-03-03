@@ -1,0 +1,73 @@
+# Mask criterion configuration for D-FINE instance segmentation
+
+DFINECriterion:
+  weight_dict: {
+    # Main losses
+    loss_vfl: 1, 
+    loss_bbox: 5, 
+    loss_giou: 2, 
+    loss_fgl: 0.15, 
+    loss_ddf: 1.5,
+    loss_mask_focal: 1.0,
+    loss_mask_dice: 1.0,
+    
+    # Auxiliary losses - standard auxiliaries
+    loss_vfl_aux_0: 0.5,
+    loss_bbox_aux_0: 2.5,
+    loss_giou_aux_0: 1.0,
+    loss_fgl_aux_0: 0.075,
+    loss_ddf_aux_0: 0.75,
+    loss_mask_focal_aux_0: 0.5,
+    loss_mask_dice_aux_0: 0.5,
+    
+    loss_vfl_aux_1: 0.5,
+    loss_bbox_aux_1: 2.5,
+    loss_giou_aux_1: 1.0,
+    loss_fgl_aux_1: 0.075,
+    loss_ddf_aux_1: 0.75,
+    loss_mask_focal_aux_1: 0.5,
+    loss_mask_dice_aux_1: 0.5,
+    
+    # Add more aux losses based on num_layers in your configuration
+    # The pattern continues for aux_2, aux_3, etc.
+    
+    # Pre-output losses
+    loss_vfl_pre: 0.5,
+    loss_bbox_pre: 2.5,
+    loss_giou_pre: 1.0,
+    loss_mask_focal_pre: 0.5,
+    loss_mask_dice_pre: 0.5,
+    
+    # Encoder outputs losses
+    loss_vfl_enc_0: 0.5,
+    loss_bbox_enc_0: 2.5,
+    loss_giou_enc_0: 1.0,
+    
+    # Denoising losses if you're using denoising
+    loss_vfl_dn_0: 0.5,
+    loss_bbox_dn_0: 2.5,
+    loss_giou_dn_0: 1.0,
+    loss_fgl_dn_0: 0.075,
+    loss_ddf_dn_0: 0.75,
+    loss_mask_focal_dn_0: 0.5,
+    loss_mask_dice_dn_0: 0.5,
+    
+    loss_vfl_dn_pre: 0.5,
+    loss_bbox_dn_pre: 2.5,
+    loss_giou_dn_pre: 1.0,
+    loss_mask_focal_dn_pre: 0.5,
+    loss_mask_dice_dn_pre: 0.5,
+  }
+  
+  # Add 'masks' to losses list
+  losses: ['vfl', 'boxes', 'local', 'masks']
+  
+  # Other criterion parameters (unchanged)
+  alpha: 0.75
+  gamma: 2.0
+  reg_max: 32
+  matcher:
+    type: HungarianMatcher
+    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2}
+    alpha: 0.25
+    gamma: 2.0
