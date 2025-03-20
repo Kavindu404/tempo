@@ -1,280 +1,229 @@
-#!/usr/bin/env python3
 """
-Inference script for fine-tuned SAM 2.1 model
+Modified from RT-DETR inference script to run inference on COCO dataset
+and save results in COCO format
 """
 
-import os
-import argparse
 import torch
-import numpy as np
-import cv2
-from PIL import Image
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+import torch.nn as nn 
+import torchvision.transforms as T
+import pycocotools.coco as coco
+import time
+from tqdm import tqdm
 import json
-
-# Import from SAM 2.1 repo
+import numpy as np 
+from PIL import Image, ImageDraw
+import datetime
+import multiprocessing
+from functools import partial
+import os
 import sys
-sys.path.append("./")  # Add SAM 2.1 repo to path
-from modeling.build_sam2 import build_sam2
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from src.core import YAMLConfig
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='SAM 2.1 inference on custom dataset')
-    parser.add_argument('--checkpoint', type=str, required=True, help='Path to fine-tuned SAM 2.1 checkpoint')
-    parser.add_argument('--base_checkpoint', type=str, required=True, help='Path to original SAM 2.1 checkpoint')
-    parser.add_argument('--image_path', type=str, required=True, help='Path to input image')
-    parser.add_argument('--prompt_type', type=str, default='box', choices=['box', 'point'], help='Prompt type')
-    parser.add_argument('--prompt', type=str, help='Prompt coordinates (x1,y1,x2,y2 for box or x,y for point)')
-    parser.add_argument('--output_dir', type=str, default='inference_output', help='Output directory')
-    parser.add_argument('--compare', action='store_true', help='Compare fine-tuned model with base model')
-    parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda or cpu)')
-    parser.add_argument('--image_size', type=int, default=1024, help='Input image size')
-    return parser.parse_args()
 
-def preprocess_image(image_path, target_size=1024):
-    """Preprocess image for inference."""
-    # Read image
-    image = cv2.imread(image_path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    
-    # Get original size
-    h, w = image.shape[:2]
-    
-    # Resize image
-    image_resized = cv2.resize(image, (target_size, target_size))
-    
-    # Normalize
-    image_tensor = torch.from_numpy(image_resized).float().permute(2, 0, 1) / 255.0
-    
-    return image_tensor.unsqueeze(0), (h, w), image
-
-def parse_prompt(prompt_str, prompt_type, image_size, orig_size):
-    """Parse prompt string to tensor."""
-    h_orig, w_orig = orig_size
-    
-    # Scale factors
-    scale_x = image_size / w_orig
-    scale_y = image_size / h_orig
-    
-    if prompt_type == 'box':
-        # Parse x1,y1,x2,y2
-        x1, y1, x2, y2 = map(float, prompt_str.split(','))
+class CocoInferenceModel(nn.Module):
+    def __init__(self, model, postprocessor):
+        super().__init__()
+        self.model = model
+        self.postprocessor = postprocessor
         
-        # Scale to target size
-        x1 = x1 * scale_x
-        y1 = y1 * scale_y
-        x2 = x2 * scale_x
-        y2 = y2 * scale_y
+    def forward(self, images, orig_target_sizes):
+        input_sizes = torch.tensor([[images.shape[-1], images.shape[-2]]], device=images.device)
+        outputs = self.model(images)
+        outputs = self.postprocessor(outputs, orig_target_sizes, input_sizes)
+        return outputs
+
+
+def preprocess_image(img_path, default_height, default_width, device):
+    """Preprocess image for inference"""
+    im_pil = Image.open(img_path).convert('RGB')
+    w, h = im_pil.size
+    orig_size = torch.tensor([w, h])[None].to(device)
+
+    scaleX = default_width / w
+    scaleY = default_height / h
+
+    scale = scaleX if scaleX < scaleY else scaleY
+
+    new_H = int(scale*h)
+    new_W = int(scale*w)
+
+    val_h = (default_height - new_H)//2
+    val_w = (default_width - new_W)//2
+
+    transforms = T.Compose([
+        T.Resize((new_H, new_W)),
+        T.Pad(padding=(val_w, val_h, val_w, val_h)),
+        T.ToTensor(),
+    ])
+
+    im_data = transforms(im_pil)[None].to(device)
+    return im_data, orig_size, im_pil
+
+
+def convert_to_coco_annotation(labels, boxes, coords, scores, image_id, threshold=0.5):
+    """Convert model output to COCO annotation format"""
+    annotations = []
+    scr = scores[0]
+    mask = scr > threshold
+    
+    lab = labels[0][mask].cpu().numpy()
+    box = boxes[0][mask].cpu().numpy()
+    scrs = scores[0][mask].cpu().numpy()
+    coord = coords[0][mask].cpu().numpy()
+    
+    for i, (label, bbox, score, polygon) in enumerate(zip(lab, box, scrs, coord)):
+        x1, y1, x2, y2 = bbox
         
-        return torch.tensor([[x1, y1, x2, y2]], dtype=torch.float32)
-    else:
-        # Parse x,y
-        x, y = map(float, prompt_str.split(','))
-        
-        # Scale to target size
-        x = x * scale_x
-        y = y * scale_y
-        
-        return torch.tensor([[x, y]], dtype=torch.float32)
-
-def load_model(checkpoint_path, base_checkpoint_path, prompt_type, device):
-    """Load SAM 2.1 model."""
-    # Determine prompt encoder based on prompt type
-    prompt_encoder = 'box' if prompt_type == 'box' else 'point'
-    
-    # Load fine-tuned model
-    model = build_sam2(
-        checkpoint=base_checkpoint_path,  # First load the base model
-        prompt_encoder=prompt_encoder,
-        pixel_mean=[123.675, 116.28, 103.53],
-        pixel_std=[58.395, 57.12, 57.375]
-    )
-    
-    # Load fine-tuned weights
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        model.load_state_dict(checkpoint)
-    
-    model = model.to(device)
-    model.eval()
-    
-    return model
-
-def load_base_model(checkpoint_path, prompt_type, device):
-    """Load base SAM 2.1 model for comparison."""
-    prompt_encoder = 'box' if prompt_type == 'box' else 'point'
-    
-    model = build_sam2(
-        checkpoint=checkpoint_path,
-        prompt_encoder=prompt_encoder,
-        pixel_mean=[123.675, 116.28, 103.53],
-        pixel_std=[58.395, 57.12, 57.375]
-    )
-    
-    model = model.to(device)
-    model.eval()
-    
-    return model
-
-def run_inference(model, image_tensor, prompt_tensor, prompt_type, device):
-    """Run inference with SAM 2.1 model."""
-    image_tensor = image_tensor.to(device)
-    prompt_tensor = prompt_tensor.to(device)
-    
-    with torch.no_grad():
-        if prompt_type == 'box':
-            outputs = model(image_tensor, boxes=prompt_tensor)
-        else:
-            points = prompt_tensor.reshape(-1, 1, 2)  # [B, 1, 2]
-            labels = torch.ones(points.shape[0], 1, device=device)  # All foreground
-            outputs = model(image_tensor, points=points, labels=labels)
-    
-    # Apply sigmoid to get probability map
-    pred_mask = torch.sigmoid(outputs) > 0.5
-    
-    return pred_mask.cpu().numpy()
-
-def visualize_results(image, mask, prompt, prompt_type, output_path):
-    """Visualize segmentation results."""
-    # Create figure
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-    
-    # Plot original image with prompt
-    ax1.imshow(image)
-    ax1.set_title("Input Image with Prompt")
-    
-    # Add prompt visualization
-    if prompt_type == 'box':
-        x1, y1, x2, y2 = prompt[0]
+        # Convert bbox format from [x1, y1, x2, y2] to [x, y, width, height]
         width = x2 - x1
         height = y2 - y1
-        rect = Rectangle((x1, y1), width, height, linewidth=2, edgecolor='r', facecolor='none')
-        ax1.add_patch(rect)
-    else:
-        ax1.scatter(prompt[0][0], prompt[0][1], c='r', s=40)
+        
+        # Convert polygon coordinates to COCO segmentation format
+        segmentation = polygon.reshape(-1).tolist()
+        
+        annotation = {
+            'id': len(annotations) + 1,  # We'll update this later
+            'image_id': image_id,
+            'category_id': int(label),
+            'bbox': [float(x1), float(y1), float(width), float(height)],
+            'segmentation': [segmentation],
+            'area': float(width * height),
+            'iscrowd': 0,
+            'score': float(score)
+        }
+        
+        annotations.append(annotation)
     
-    # Plot mask
-    ax2.imshow(image)
-    mask_vis = np.ma.masked_where(mask[0, 0] == 0, mask[0, 0])
-    ax2.imshow(mask_vis, alpha=0.5, cmap='jet')
-    ax2.set_title("Predicted Mask")
-    
-    # Save figure
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
+    return annotations
 
-def compare_models(fine_tuned_mask, base_mask, image, prompt, prompt_type, output_path):
-    """Compare results from fine-tuned and base models."""
-    # Create figure
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
-    
-    # Plot original image with prompt
-    ax1.imshow(image)
-    ax1.set_title("Input Image with Prompt")
-    
-    # Add prompt visualization
-    if prompt_type == 'box':
-        x1, y1, x2, y2 = prompt[0]
-        width = x2 - x1
-        height = y2 - y1
-        rect = Rectangle((x1, y1), width, height, linewidth=2, edgecolor='r', facecolor='none')
-        ax1.add_patch(rect)
-    else:
-        ax1.scatter(prompt[0][0], prompt[0][1], c='r', s=40)
-    
-    # Plot base model mask
-    ax2.imshow(image)
-    base_mask_vis = np.ma.masked_where(base_mask[0, 0] == 0, base_mask[0, 0])
-    ax2.imshow(base_mask_vis, alpha=0.5, cmap='cool')
-    ax2.set_title("Base Model Mask")
-    
-    # Plot fine-tuned model mask
-    ax3.imshow(image)
-    ft_mask_vis = np.ma.masked_where(fine_tuned_mask[0, 0] == 0, fine_tuned_mask[0, 0])
-    ax3.imshow(ft_mask_vis, alpha=0.5, cmap='jet')
-    ax3.set_title("Fine-tuned Model Mask")
-    
-    # Save figure
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
 
-def main():
-    args = parse_args()
+def process_batch(model, img_batch, img_ids, default_height, default_width, device, threshold=0.5):
+    """Process a batch of images"""
+    batch_results = []
     
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    for img_path, img_id in zip(img_batch, img_ids):
+        img_data, orig_size, _ = preprocess_image(img_path, default_height, default_width, device)
+        outputs = model(img_data, orig_size)
+        labels, boxes, coords, scores = outputs
+        
+        annotations = convert_to_coco_annotation(labels, boxes, coords, scores, img_id, threshold)
+        batch_results.extend(annotations)
     
-    # Set device
-    device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
-    
-    # Preprocess image
-    image_tensor, orig_size, original_image = preprocess_image(args.image_path, args.image_size)
-    
-    # Parse prompt
-    if args.prompt:
-        prompt_tensor = parse_prompt(args.prompt, args.prompt_type, args.image_size, orig_size)
-    else:
-        # If no prompt provided, use default prompt (center box or point)
-        h, w = orig_size
-        if args.prompt_type == 'box':
-            # Default box covering central 50% of the image
-            cx, cy = w / 2, h / 2
-            box_w, box_h = w / 4, h / 4
-            prompt_tensor = parse_prompt(f"{cx-box_w},{cy-box_h},{cx+box_w},{cy+box_h}", 
-                                         args.prompt_type, args.image_size, orig_size)
+    return batch_results
+
+
+def main(args):
+    """Main function to run inference on COCO dataset and save results"""
+    # Load configuration
+    cfg = YAMLConfig(args.config, resume=args.resume)
+
+    if 'HGNetv2' in cfg.yaml_cfg:
+        cfg.yaml_cfg['HGNetv2']['pretrained'] = False
+        
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location='cpu') 
+        if 'ema' in checkpoint:
+            state = checkpoint['ema']['module']
         else:
-            # Default point at center of the image
-            prompt_tensor = parse_prompt(f"{w/2},{h/2}", args.prompt_type, args.image_size, orig_size)
-    
-    # Load fine-tuned model
-    print("Loading fine-tuned model...")
-    fine_tuned_model = load_model(args.checkpoint, args.base_checkpoint, args.prompt_type, device)
-    
-    # Run inference with fine-tuned model
-    print("Running inference with fine-tuned model...")
-    fine_tuned_mask = run_inference(fine_tuned_model, image_tensor, prompt_tensor, args.prompt_type, device)
-    
-    # Compare with base model if requested
-    if args.compare:
-        print("Loading base model for comparison...")
-        base_model = load_base_model(args.base_checkpoint, args.prompt_type, device)
-        
-        print("Running inference with base model...")
-        base_mask = run_inference(base_model, image_tensor, prompt_tensor, args.prompt_type, device)
-        
-        # Visualize comparison
-        output_path = os.path.join(args.output_dir, "comparison_result.png")
-        compare_models(fine_tuned_mask, base_mask, original_image, prompt_tensor.cpu().numpy(), 
-                      args.prompt_type, output_path)
-        print(f"Comparison result saved to {output_path}")
+            state = checkpoint['model']
     else:
-        # Visualize fine-tuned model result only
-        output_path = os.path.join(args.output_dir, "inference_result.png")
-        visualize_results(original_image, fine_tuned_mask, prompt_tensor.cpu().numpy(), 
-                         args.prompt_type, output_path)
-        print(f"Result saved to {output_path}")
+        raise AttributeError('Only support resume to load model.state_dict by now.')
+
+    # Load model
+    cfg.model.load_state_dict(state)
+    default_height, default_width = cfg.model.encoder.eval_spatial_size
+
+    # Create model
+    model = CocoInferenceModel(
+        cfg.model.deploy(),
+        cfg.postprocessor.deploy()
+    ).to(args.device)
+    model.eval()
+
+    # Load COCO dataset
+    coco_api = coco.COCO(args.input_json)
+    image_ids = coco_api.getImgIds()
     
-    # Save mask as binary file
-    mask_path = os.path.join(args.output_dir, "mask.png")
-    cv2.imwrite(mask_path, (fine_tuned_mask[0, 0] * 255).astype(np.uint8))
-    print(f"Binary mask saved to {mask_path}")
+    # Get image paths
+    images = coco_api.loadImgs(image_ids)
+    img_paths = [os.path.join(args.img_dir, img['file_name']) for img in images]
     
-    # Save information about the inference
-    info = {
-        "image_path": args.image_path,
-        "prompt_type": args.prompt_type,
-        "prompt": args.prompt,
-        "checkpoint": args.checkpoint,
-        "image_size": args.image_size,
-        "device": args.device
+    # Create output COCO format
+    coco_output = {
+        'images': images,
+        'annotations': [],
+        'categories': coco_api.loadCats(coco_api.getCatIds()),
+        'info': {
+            'description': 'Inference results',
+            'version': '1.0',
+            'year': datetime.datetime.now().year,
+            'contributor': 'RT-DETR inference script',
+            'date_created': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }
     }
     
-    with open(os.path.join(args.output_dir, "inference_info.json"), 'w') as f:
-        json.dump(info, f, indent=4)
+    # Determine batch size based on available resources
+    batch_size = args.batch_size if args.batch_size > 0 else 4  # Default batch size
+    
+    # Process images with batching and tqdm progress bar
+    all_annotations = []
+    annotation_id = 1
+    
+    print(f"Running inference on {len(img_paths)} images with batch size {batch_size}...")
+    
+    with torch.no_grad():
+        for i in tqdm(range(0, len(img_paths), batch_size), desc="Processing images"):
+            batch_img_paths = img_paths[i:i+batch_size]
+            batch_img_ids = image_ids[i:i+batch_size]
+            
+            batch_results = []
+            for j, (img_path, img_id) in enumerate(zip(batch_img_paths, batch_img_ids)):
+                img_data, orig_size, _ = preprocess_image(img_path, default_height, default_width, args.device)
+                outputs = model(img_data, orig_size)
+                labels, boxes, coords, scores = outputs
+                
+                annotations = convert_to_coco_annotation(labels, boxes, coords, scores, img_id, args.threshold)
+                
+                # Update annotation IDs
+                for ann in annotations:
+                    ann['id'] = annotation_id
+                    annotation_id += 1
+                
+                batch_results.extend(annotations)
+            
+            all_annotations.extend(batch_results)
+            
+            # Optionally save intermediate results
+            if args.save_interval > 0 and (i + batch_size) % args.save_interval == 0:
+                temp_output = coco_output.copy()
+                temp_output['annotations'] = all_annotations
+                with open(f"{args.output_json}.temp", 'w') as f:
+                    json.dump(temp_output, f)
+    
+    # Add all annotations to the output
+    coco_output['annotations'] = all_annotations
+    
+    # Save final results
+    with open(args.output_json, 'w') as f:
+        json.dump(coco_output, f)
+    
+    print(f"Inference complete. Results saved to {args.output_json}")
+    print(f"Total annotations: {len(all_annotations)}")
 
-if __name__ == "__main__":
-    main()
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Run inference on COCO dataset and save results in COCO format')
+    parser.add_argument('-c', '--config', type=str, help='Model configuration file')
+    parser.add_argument('-r', '--resume', type=str, help='Checkpoint file to resume from')
+    parser.add_argument('-d', '--device', type=str, default='cuda', help='Device to run inference on')
+    parser.add_argument('--input_json', type=str, required=True, help='Input COCO JSON file')
+    parser.add_argument('--img_dir', type=str, required=True, help='Directory containing images')
+    parser.add_argument('--output_json', type=str, required=True, help='Output COCO JSON file')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for inference')
+    parser.add_argument('--threshold', type=float, default=0.5, help='Confidence threshold for detections')
+    parser.add_argument('--save_interval', type=int, default=100, help='Save intermediate results every N batches (0 to disable)')
+    
+    args = parser.parse_args()
+    main(args)
