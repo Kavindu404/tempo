@@ -1,0 +1,331 @@
+txt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.ops as ops
+from torch.utils.data import DataLoader, Dataset
+import os
+import numpy as np
+from PIL import Image
+
+# 1. Create a simple mask head
+class MaskRCNNHead(nn.Module):
+    def __init__(self, in_channels, hidden_dim=256, num_conv=4):
+        super().__init__()
+        
+        # Series of convolutions to extract mask features
+        self.conv_layers = nn.ModuleList()
+        for _ in range(num_conv):
+            conv = nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1)
+            self.conv_layers.append(conv)
+            in_channels = hidden_dim
+            
+        # Final layer to predict binary mask
+        self.mask_pred = nn.Conv2d(hidden_dim, 1, kernel_size=1)
+        
+        # Initialize weights
+        for layer in self.conv_layers:
+            nn.init.kaiming_normal_(layer.weight, mode="fan_out", nonlinearity="relu")
+            nn.init.constant_(layer.bias, 0)
+        nn.init.kaiming_normal_(self.mask_pred.weight, mode="fan_out", nonlinearity="sigmoid")
+        nn.init.constant_(self.mask_pred.bias, 0)
+    
+    def forward(self, x):
+        for conv in self.conv_layers:
+            x = F.relu(conv(x))
+        return self.mask_pred(x)
+
+# 2. Create a wrapper model that combines detection and segmentation
+class DetectionWithSegmentation(nn.Module):
+    def __init__(self, detection_model, mask_head_channels=256):
+        super().__init__()
+        self.detection_model = detection_model
+        
+        # Freeze detection model parameters
+        for param in self.detection_model.parameters():
+            param.requires_grad = False
+        
+        # Create mask head - find the feature size from detection model
+        # Assuming detection_model.backbone outputs feature maps
+        self.mask_head = MaskRCNNHead(in_channels=mask_head_channels)
+        
+        # Create ROI Align layer for extracting features for each instance
+        self.roi_align = ops.RoIAlign(output_size=(28, 28), spatial_scale=1.0, sampling_ratio=2)
+    
+    def forward(self, images, targets=None):
+        # Run detection model to get boxes
+        with torch.no_grad():
+            detection_output = self.detection_model(images)
+            
+            # Get backbone features (assuming they're accessible)
+            features = self.detection_model.backbone(images)
+            
+            # Use the last/highest level feature map
+            if isinstance(features, list):
+                feature_map = features[-1]  # Usually the most semantic feature map
+            else:
+                feature_map = features
+        
+        batch_size = images.shape[0]
+        all_boxes = detection_output["pred_boxes"]  # Shape: [batch_size, num_detections, 4]
+        all_scores = detection_output["pred_logits"]  # Shape: [batch_size, num_detections, num_classes]
+        
+        # Convert boxes to RoI format [batch_idx, x1, y1, x2, y2]
+        roi_boxes = []
+        for batch_idx in range(batch_size):
+            # Convert from cxcywh to xyxy if needed
+            boxes = ops.box_convert(all_boxes[batch_idx], in_fmt="cxcywh", out_fmt="xyxy")
+            
+            # Add batch index
+            batch_indices = torch.full((boxes.shape[0], 1), batch_idx, 
+                                     dtype=torch.float32, device=boxes.device)
+            boxes_with_batch = torch.cat([batch_indices, boxes], dim=1)
+            roi_boxes.append(boxes_with_batch)
+        
+        if not roi_boxes:
+            # Return detection outputs with empty masks if no boxes
+            detection_output["pred_masks"] = torch.zeros((batch_size, 0, images.shape[2], images.shape[3]), 
+                                                       device=images.device)
+            return detection_output
+            
+        # Concatenate all ROIs
+        roi_boxes = torch.cat(roi_boxes, dim=0)
+        
+        # Extract features for each ROI using ROI Align
+        roi_features = self.roi_align(feature_map, roi_boxes)
+        
+        # Generate masks for each ROI
+        instance_masks = self.mask_head(roi_features)
+        
+        # Reshape masks back to per-image format
+        masks_per_image = []
+        start_idx = 0
+        for batch_idx in range(batch_size):
+            num_instances = all_boxes[batch_idx].shape[0]
+            if num_instances > 0:
+                masks = instance_masks[start_idx:start_idx + num_instances]
+                start_idx += num_instances
+                
+                # Upsample masks to image size
+                masks = F.interpolate(masks, size=images.shape[2:], mode="bilinear", align_corners=False)
+                masks_per_image.append(masks.squeeze(1))
+            else:
+                # Empty mask tensor for this image
+                masks_per_image.append(torch.zeros((0, images.shape[2], images.shape[3]), 
+                                               device=images.device))
+        
+        # Add masks to detection output
+        detection_output["pred_masks"] = torch.stack(masks_per_image)
+        
+        # If in training mode, compute loss
+        if self.training and targets is not None:
+            mask_loss = self.compute_mask_loss(detection_output, targets)
+            detection_output["mask_loss"] = mask_loss
+            
+        return detection_output
+    
+    def compute_mask_loss(self, outputs, targets):
+        """Compute binary cross-entropy loss between predicted and ground truth masks"""
+        # Match predictions to targets (assuming some matching mechanism)
+        # For simplicity, use IoU-based matching
+        mask_loss = 0
+        for idx, (pred_masks, target) in enumerate(zip(outputs["pred_masks"], targets)):
+            if "masks" not in target or len(target["masks"]) == 0:
+                continue
+                
+            pred_boxes = outputs["pred_boxes"][idx]
+            target_boxes = target["boxes"]
+            target_masks = target["masks"]
+            
+            # Calculate IoU between predicted and target boxes
+            ious = ops.box_iou(
+                ops.box_convert(pred_boxes, in_fmt="cxcywh", out_fmt="xyxy"),
+                ops.box_convert(target_boxes, in_fmt="cxcywh", out_fmt="xyxy")
+            )
+            
+            # Match each prediction to its highest IoU target
+            matched_indices = ious.max(dim=1)[1]
+            
+            # Get matched masks
+            matched_target_masks = target_masks[matched_indices]
+            
+            # Compute loss only for predictions with IoU > threshold
+            valid_mask = ious.max(dim=1)[0] > 0.5
+            if valid_mask.sum() > 0:
+                loss = F.binary_cross_entropy_with_logits(
+                    pred_masks[valid_mask], 
+                    matched_target_masks[valid_mask].float(),
+                    reduction="mean"
+                )
+                mask_loss += loss
+        
+        return mask_loss / len(targets) if len(targets) > 0 else torch.tensor(0.0, device=outputs["pred_masks"].device)
+
+# 3. Create a simple dataset class that includes masks
+class InstanceSegmentationDataset(Dataset):
+    def __init__(self, img_dir, ann_file, transform=None):
+        # This is a placeholder - you would need to implement loading of 
+        # image data and mask annotations from your dataset
+        self.img_dir = img_dir
+        self.ann_file = ann_file
+        self.transform = transform
+        
+        # Load annotations (this would depend on your dataset format)
+        # For COCO format, you could use pycocotools
+        self.annotations = self._load_annotations()
+        
+    def _load_annotations(self):
+        # Placeholder - load annotations from file
+        # Example for COCO:
+        from pycocotools.coco import COCO
+        return COCO(self.ann_file)
+        
+    def __len__(self):
+        return len(self.annotations.getImgIds())
+        
+    def __getitem__(self, idx):
+        # Get image ID
+        img_id = self.annotations.getImgIds()[idx]
+        
+        # Load image
+        img_info = self.annotations.loadImgs(img_id)[0]
+        image_path = os.path.join(self.img_dir, img_info['file_name'])
+        image = Image.open(image_path).convert("RGB")
+        
+        # Get annotations for this image
+        ann_ids = self.annotations.getAnnIds(imgIds=img_id)
+        anns = self.annotations.loadAnns(ann_ids)
+        
+        # Extract bounding boxes and masks
+        boxes = []
+        masks = []
+        labels = []
+        
+        for ann in anns:
+            # Skip annotations without segmentation
+            if 'segmentation' not in ann:
+                continue
+                
+            # Get bounding box
+            x, y, w, h = ann['bbox']
+            boxes.append([x + w/2, y + h/2, w, h])  # Convert to cxcywh format
+            
+            # Get mask
+            mask = self.annotations.annToMask(ann)
+            masks.append(mask)
+            
+            # Get label
+            labels.append(ann['category_id'])
+            
+        # Convert to tensors
+        boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        masks = torch.as_tensor(np.stack(masks) if masks else np.zeros((0, img_info['height'], img_info['width'])), 
+                              dtype=torch.uint8)
+        labels = torch.as_tensor(labels, dtype=torch.int64)
+        
+        # Apply transformations if any
+        if self.transform:
+            image, target = self.transform(image, {"boxes": boxes, "masks": masks, "labels": labels})
+        else:
+            # Convert PIL image to tensor
+            image = torch.as_tensor(np.array(image), dtype=torch.float32).permute(2, 0, 1)
+            target = {"boxes": boxes, "masks": masks, "labels": labels}
+            
+        return image, target
+
+# 4. Training function
+def train_segmentation_model(model, train_loader, optimizer, device, num_epochs=10):
+    model.train()
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for i, (images, targets) in enumerate(train_loader):
+            images = [img.to(device) for img in images]
+            
+            # Convert targets to device
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            
+            # Forward pass
+            outputs = model(images, targets)
+            
+            # Compute loss
+            mask_loss = outputs["mask_loss"]
+            
+            # Backward and optimize
+            optimizer.zero_grad()
+            mask_loss.backward()
+            optimizer.step()
+            
+            running_loss += mask_loss.item()
+            
+            if i % 10 == 0:
+                print(f"Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(train_loader)}], "
+                      f"Mask Loss: {mask_loss.item():.4f}")
+        
+        print(f"Epoch [{epoch+1}/{num_epochs}], Avg Loss: {running_loss/len(train_loader):.4f}")
+    
+    return model
+
+# 5. Main training script
+def main():
+    # Load pretrained detection model
+    # This is a placeholder - you'd load your specific model
+    from src.core import YAMLConfig
+    from src.solver import TASKS
+    
+    # Load detection model configuration
+    cfg = YAMLConfig("configs/dfine/dfine_hgnetv2_s_coco.yml")
+    
+    # Create solver to get the model
+    solver = TASKS[cfg.yaml_cfg["task"]](cfg)
+    
+    # Load checkpoint
+    checkpoint_path = "output/detection_model/best_stg2.pth"
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    
+    # Load checkpoint to model
+    if 'model' in checkpoint:
+        solver.model.load_state_dict(checkpoint['model'])
+    elif 'ema' in checkpoint and 'module' in checkpoint['ema']:
+        solver.model.load_state_dict(checkpoint['ema']['module'])
+    
+    # Get detection model
+    detection_model = solver.model
+    
+    # Create segmentation model
+    segmentation_model = DetectionWithSegmentation(detection_model)
+    
+    # Move model to device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    segmentation_model.to(device)
+    
+    # Create dataset and dataloader
+    dataset = InstanceSegmentationDataset(
+        img_dir="path/to/images",
+        ann_file="path/to/annotations.json"
+    )
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=8,
+        shuffle=True,
+        collate_fn=lambda x: tuple(zip(*x))  # Custom collate function to handle varying size data
+    )
+    
+    # Create optimizer - only train mask head parameters
+    optimizer = torch.optim.Adam(segmentation_model.mask_head.parameters(), lr=1e-4)
+    
+    # Train model
+    trained_model = train_segmentation_model(
+        model=segmentation_model,
+        train_loader=dataloader,
+        optimizer=optimizer,
+        device=device,
+        num_epochs=10
+    )
+    
+    # Save model
+    torch.save(trained_model.state_dict(), "output/segmentation_model.pth")
+
+if __name__ == "__main__":
+    main()
