@@ -1,0 +1,273 @@
+Tetatststs
+
+
+def _generate_spatial_attention_maps(self, attention_data, image_shape):
+    """
+    Convert attention data to spatial attention maps using D-FINE's deformable attention mechanism.
+    
+    Args:
+        attention_data: Dict containing attention weights, reference points, and spatial shapes
+        image_shape: Tuple of (batch_size, channels, height, width)
+    
+    Returns:
+        Tensor of shape [batch_size, num_queries, height, width] containing spatial attention maps
+    """
+    batch_size, _, height, width = image_shape
+    
+    # Extract attention data
+    attention_weights = attention_data['weights']  # [batch_size, num_queries, num_heads, num_points]
+    reference_points = attention_data['reference_points']  # [batch_size, num_queries, num_levels, 2]
+    spatial_shapes = attention_data['spatial_shapes']  # List of (h, w) for each level
+    
+    # Reshape attention weights: combine heads
+    num_queries = attention_weights.shape[1]
+    num_heads = attention_weights.shape[2]
+    num_levels = len(spatial_shapes)
+    
+    # Combine attention weights across heads
+    attention_weights = attention_weights.mean(dim=2)  # [batch_size, num_queries, num_points]
+    
+    # Find number of points per level
+    points_per_level = [shape[0] * shape[1] for shape in spatial_shapes]
+    total_points = sum(points_per_level)
+    
+    # Split attention weights by level
+    level_start_idx = 0
+    attention_maps = []
+    
+    for b in range(batch_size):
+        query_maps = []
+        
+        for q in range(num_queries):
+            # Create empty attention map at original image resolution
+            attention_map = torch.zeros((height, width), device=attention_weights.device)
+            
+            # Process each feature level
+            level_start_idx = 0
+            for lvl, (lvl_h, lvl_w) in enumerate(spatial_shapes):
+                # Get reference points for this level
+                # In D-FINE, reference points are in normalized coordinates [0,1]
+                ref_point = reference_points[b, q, lvl]  # [2]
+                
+                # Get number of sampling points for this level
+                num_points = points_per_level[lvl]
+                
+                # Get attention weights for this level
+                lvl_weights = attention_weights[b, q, level_start_idx:level_start_idx+num_points]
+                level_start_idx += num_points
+                
+                # Reshape attention weights to match feature map
+                lvl_weights = lvl_weights.reshape(lvl_h, lvl_w)
+                
+                # Upscale to image resolution
+                scale_factor_h = height / lvl_h
+                scale_factor_w = width / lvl_w
+                
+                lvl_map = F.interpolate(
+                    lvl_weights.unsqueeze(0).unsqueeze(0),
+                    scale_factor=(scale_factor_h, scale_factor_w),
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze()
+                
+                # Add to overall attention map
+                # In D-FINE, each query can attend to multiple locations across levels
+                # We combine them with max operation to preserve strong attention signals
+                attention_map = torch.max(attention_map, lvl_map)
+            
+            query_maps.append(attention_map)
+        
+        # Stack query maps for this batch
+        attention_maps.append(torch.stack(query_maps))
+    
+    # Stack batch dimension
+    return torch.stack(attention_maps)  # [batch_size, num_queries, height, width]
+
+
+def forward(self, x, targets=None):
+    # Run detection model
+    outputs = self.detection_model(x)
+    
+    if "attention_maps" not in outputs:
+        # If attention maps are not available, return detection results only
+        return outputs
+    
+    # Get attention from the final decoder layer
+    final_attn_data = outputs["attention_maps"][-1]  # Use the last layer's attention
+    
+    # Process attention maps to create instance masks
+    batch_size, _, height, width = x.shape
+    
+    # Generate spatial attention maps from deformable attention
+    spatial_attention = self._generate_spatial_attention_maps(
+        final_attn_data, x.shape
+    )  # [batch_size, num_queries, height, width]
+    
+    # Get predictions
+    pred_logits = outputs["pred_logits"]  # [batch_size, num_queries, num_classes]
+    pred_boxes = outputs["pred_boxes"]    # [batch_size, num_queries, 4]
+    
+    # Process each image in the batch
+    all_masks = []
+    for b in range(batch_size):
+        # Get scores (max class probability)
+        scores = pred_logits[b].sigmoid().max(dim=-1)[0]  # [num_queries]
+        
+        # Filter by confidence
+        keep = scores > self.attention_threshold
+        
+        if keep.sum() == 0:
+            # No valid detections
+            masks = torch.zeros((0, height, width), device=x.device)
+        else:
+            # Get attention maps for valid queries
+            query_attn_maps = spatial_attention[b, keep]  # [num_valid, height, width]
+            
+            # Process through projection layer to refine masks
+            instance_masks = []
+            for attn_map in query_attn_maps:
+                # Process through projection layer
+                refined_mask = self.mask_projection(attn_map.unsqueeze(0).unsqueeze(0))
+                refined_mask = refined_mask.sigmoid().squeeze(0)
+                instance_masks.append(refined_mask)
+            
+            # Stack masks
+            masks = torch.cat(instance_masks, dim=0) if instance_masks else torch.zeros((0, height, width), device=x.device)
+        
+        all_masks.append(masks)
+    
+    # Add masks to outputs
+    outputs["pred_masks"] = all_masks
+    
+    # Compute loss during training if ground truth available
+    if self.training and targets is not None and all("masks" in t for t in targets):
+        mask_loss = self._compute_mask_loss(outputs, targets)
+        outputs["mask_loss"] = mask_loss
+    
+    return outputs
+
+
+# Create file: src/zoo/dfine_segmentation.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.ops as ops
+
+class DFINESegmentation(nn.Module):
+    def __init__(self, detection_model):
+        super().__init__()
+        self.detection_model = detection_model
+        
+        # Freeze detection model
+        for param in self.detection_model.parameters():
+            param.requires_grad = False
+            
+        # Mask projection network
+        self.mask_projection = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 1, kernel_size=1)
+        )
+    
+    def forward(self, x, targets=None):
+        # Run detection model
+        outputs = self.detection_model(x)
+        
+        # Generate masks from attention
+        if "attention_maps" in outputs:
+            attn_data = outputs["attention_maps"][-1]
+            
+            # Generate spatial attention maps
+            spatial_attn = self._generate_spatial_attention_maps(attn_data, x.shape)
+            
+            # Add masks to outputs
+            outputs["pred_masks"] = self._generate_instance_masks(spatial_attn, outputs)
+            
+            # Compute loss during training
+            if self.training and targets is not None:
+                outputs["mask_loss"] = self._compute_mask_loss(outputs, targets)
+        
+        return outputs
+    
+    def _generate_spatial_attention_maps(self, attn_data, image_shape):
+        # Implementation here
+        pass
+        
+    def _generate_instance_masks(self, spatial_attn, outputs):
+        # Implementation here
+        pass
+        
+    def _compute_mask_loss(self, outputs, targets):
+        # Implementation here
+        pass
+
+
+# Create file: train_segmentation.py
+import torch
+import argparse
+
+from src.core import YAMLConfig
+from src.solver import TASKS
+from src.zoo.dfine_segmentation import DFINESegmentation
+
+def main(args):
+    # Load config
+    cfg = YAMLConfig(args.config)
+    
+    # Create and load detector
+    solver = TASKS[cfg.yaml_cfg["task"]](cfg)
+    checkpoint = torch.load(args.pretrained, map_location='cpu')
+    solver.model.load_state_dict(checkpoint['model'] if 'model' in checkpoint 
+                               else checkpoint['ema']['module'])
+    
+    # Create segmentation model
+    seg_model = DFINESegmentation(solver.model)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    seg_model.to(device)
+    
+    # Create dataset with masks
+    dataset = CocoDetection(
+        img_folder=args.img_folder,
+        ann_file=args.ann_file,
+        transforms=None,
+        return_masks=True
+    )
+    
+    # Create dataloader
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=4, shuffle=True,
+        collate_fn=lambda x: tuple(zip(*x))
+    )
+    
+    # Create optimizer - only train mask projection
+    optimizer = torch.optim.Adam(seg_model.mask_projection.parameters(), lr=1e-4)
+    
+    # Training loop
+    for epoch in range(args.epochs):
+        for i, (images, targets) in enumerate(loader):
+            images = torch.stack(images).to(device)
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            
+            outputs = seg_model(images, targets)
+            loss = outputs["mask_loss"]
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            print(f"Epoch {epoch}, Step {i}, Loss: {loss.item()}")
+        
+        # Save checkpoint
+        torch.save(seg_model.state_dict(), f"{args.output}/model_{epoch}.pth")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--pretrained", type=str, required=True)
+    parser.add_argument("--img_folder", type=str, required=True)
+    parser.add_argument("--ann_file", type=str, required=True)
+    parser.add_argument("--output", type=str, default="./output/segmentation")
+    parser.add_argument("--epochs", type=int, default=10)
+    
+    args = parser.parse_args()
+    main(args)
