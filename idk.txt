@@ -1,0 +1,225 @@
+# File: criterion.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+
+from .box_ops import box_cxcywh_to_xyxy, generalized_box_iou
+from ...misc.dist_utils import get_world_size, is_dist_available_and_initialized
+from ...core import register
+
+
+@register()
+class Criterion(nn.Module):
+    """Computes combined detection and mask loss for ContourFormer."""
+    __share__ = ['num_classes']
+    __inject__ = ['matcher']
+
+    def __init__(
+        self,
+        matcher,
+        weight_dict,
+        losses,
+        alpha=0.2,
+        gamma=2.0,
+        num_classes=80,
+        boxes_weight_format=None
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.matcher = matcher
+        self.weight_dict = weight_dict
+        # Ensure 'masks' included
+        self.losses = losses if 'masks' in losses else losses + ['masks']
+        self.alpha = alpha
+        self.gamma = gamma
+        self.boxes_weight_format = boxes_weight_format
+
+    def forward(self, outputs, targets, **kwargs):
+        indices = self.matcher(outputs, targets)
+        num_boxes = self._get_positive_nums(indices)
+        loss_dict = {}
+        for loss in self.losses:
+            l = self.get_loss(loss, outputs, targets, indices, num_boxes)
+            for k, v in l.items():
+                if k in self.weight_dict:
+                    loss_dict[k] = v * self.weight_dict[k]
+        return loss_dict
+
+    def _get_positive_nums(self, indices):
+        num_pos = sum(len(src) for src, _ in indices)
+        num_pos = torch.as_tensor([num_pos], dtype=torch.float32, device=indices[0][0].device)
+        if is_dist_available_and_initialized():
+            torch.distributed.all_reduce(num_pos)
+        return torch.clamp(num_pos / get_world_size(), min=1).item()
+
+    def loss_boxes(self, outputs, targets, indices, num_boxes, **kwargs):
+        batch_idx, src_idx = self._get_src_permutation_idx(indices)
+        src = outputs['pred_boxes'][batch_idx, src_idx]
+        tgt = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        # L1
+        loss_bbox = F.l1_loss(src, tgt, reduction='none').sum() / num_boxes
+        # GIoU
+        loss_giou = 1 - torch.diag(
+            generalized_box_iou(
+                box_cxcywh_to_xyxy(src), box_cxcywh_to_xyxy(tgt)
+            )
+        )
+        loss_giou = loss_giou.sum() / num_boxes
+        return {'loss_bbox': loss_bbox, 'loss_giou': loss_giou}
+
+    def loss_focal(self, outputs, targets, indices, num_boxes):
+        src_logits = outputs['pred_logits']
+        batch_idx, src_idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t['labels'][j] for t, (_, j) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
+                                    dtype=torch.int64, device=src_logits.device)
+        target_classes[batch_idx, src_idx] = target_classes_o
+        target_onehot = F.one_hot(target_classes, num_classes=self.num_classes+1)[..., :-1]
+        loss = torchvision.ops.sigmoid_focal_loss(
+            src_logits, target_onehot.to(src_logits.dtype), self.alpha, self.gamma, reduction='sum'
+        ) / num_boxes
+        return {'loss_focal': loss}
+
+    def loss_masks(self, outputs, targets, indices, num_boxes):
+        batch_idx, src_idx = self._get_src_permutation_idx(indices)
+        pred = outputs['pred_masks'][batch_idx, src_idx]  # [M, H, W]
+        tgt = torch.cat([t['masks'][J] for t, (_, J) in zip(targets, indices)], dim=0).to(pred.device)
+        # BCE
+        bce = F.binary_cross_entropy_with_logits(pred, tgt.float(), reduction='mean')
+        # Dice
+        prob = pred.sigmoid()
+        flat_pred = prob.flatten(1)
+        flat_tgt = tgt.flatten(1).float()
+        inter = (flat_pred * flat_tgt).sum(1)
+        union = flat_pred.sum(1) + flat_tgt.sum(1)
+        dice = 1 - (2 * inter + 1e-6) / (union + 1e-6)
+        dice_loss = dice.mean()
+        return {'loss_mask': bce, 'loss_dice': dice_loss}
+
+    def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
+        loss_map = {
+            'boxes': self.loss_boxes,
+            'focal': self.loss_focal,
+            'masks': self.loss_masks,
+        }
+        assert loss in loss_map, f"Unknown loss {loss}"
+        return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
+
+    def _get_src_permutation_idx(self, indices):
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx   = torch.cat([src for src, _ in indices])
+        return batch_idx, src_idx
+
+
+# File: postprocessor.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import pycocotools.coco as coco
+
+from ...core import register
+
+
+def mod(a, b): return a - a // b * b
+
+@register()
+class PostProcessor(nn.Module):
+    __share__ = ['num_classes', 'use_focal_loss', 'num_top_queries', 'ratio_scale']
+
+    def __init__(
+        self,
+        num_classes=80,
+        ann_file=None,
+        use_focal_loss=True,
+        num_top_queries=300,
+        ratio_scale=False
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.use_focal_loss = use_focal_loss
+        self.num_top_queries = num_top_queries
+        self.deploy_mode = False
+        self.ratio_scale = ratio_scale
+        if ann_file:
+            self.coco = coco.COCO(ann_file)
+            ids = self.coco.getCatIds()
+            self.contig_to_json = {i: cid for i, cid in enumerate(ids)}
+
+    def extra_repr(self):
+        return f'use_focal_loss={self.use_focal_loss}, num_top_queries={self.num_top_queries}, ratio_scale={self.ratio_scale}'
+
+    def forward(self, outputs, orig_target_sizes: torch.Tensor, input_sizes: torch.Tensor):
+        logits = outputs['pred_logits']  # [B,Q,C]
+        boxes  = outputs['pred_boxes']   # [B,Q,4] normalized cxcywh
+        masks  = outputs.get('pred_masks', None)
+
+        # Denormalize boxes
+        if self.ratio_scale:
+            boxes = boxes * input_sizes.repeat(1,2)[:,None,:]
+            B, Q, _ = boxes.shape
+            for i in range(B):
+                ow, oh = orig_target_sizes[i].tolist()
+                iw, ih = input_sizes[0].tolist()
+                scale = min(iw/ow, ih/oh)
+                nw, nh = scale*ow, scale*oh
+                dx, dy = (iw-nw)/2, (ih-nh)/2
+                boxes[i,:,0::2] = ((boxes[i,:,0::2]-dx).clamp(0,ow))/scale
+                boxes[i,:,1::2] = ((boxes[i,:,1::2]-dy).clamp(0,oh))/scale
+        else:
+            boxes = boxes * orig_target_sizes.unsqueeze(1)
+
+        # Top-k selection
+        if self.use_focal_loss:
+            scores = logits.sigmoid()
+            scores, idx = torch.topk(scores.flatten(1), self.num_top_queries, dim=-1)
+            labels = mod(idx, self.num_classes)
+            idx = idx // self.num_classes
+            boxes = boxes.gather(1, idx.unsqueeze(-1).expand(-1,-1,4))
+            if masks is not None:
+                masks = masks.gather(
+                    1,
+                    idx.view(-1,self.num_top_queries,1,1)
+                       .expand(-1,-1,masks.size(-2), masks.size(-1))
+                )
+        else:
+            probs = logits.softmax(-1)[..., :-1]
+            scores, labels = probs.max(-1)
+            if scores.size(1) > self.num_top_queries:
+                scores, idx = torch.topk(scores, self.num_top_queries, dim=-1)
+                labels = labels.gather(1, idx)
+                boxes = boxes.gather(1, idx.unsqueeze(-1).expand(-1,-1,4))
+                if masks is not None:
+                    masks = masks.gather(
+                        1,
+                        idx.view(-1,self.num_top_queries,1,1)
+                           .expand(-1,-1,masks.size(-2), masks.size(-1))
+                    )
+
+        # Convert to xyxy
+        boxes = torchvision.ops.box_convert(boxes, in_fmt='cxcywh', out_fmt='xyxy')
+
+        # Upsample & threshold masks
+        if masks is not None:
+            size = tuple(orig_target_sizes[0].tolist())
+            masks = F.interpolate(masks, size=size, mode='bilinear', align_corners=False)
+            masks = masks.sigmoid()
+
+        results = []
+        for i in range(boxes.size(0)):
+            b = boxes[i]
+            s = (scores[i] if self.use_focal_loss else scores[i])
+            l = labels if self.use_focal_loss else labels[i]
+            if hasattr(self, 'contig_to_json'):
+                l = torch.tensor([self.contig_to_json[int(x.item())] for x in l], device=l.device)
+            m = masks[i] > 0.5 if masks is not None else None
+            results.append({'boxes': b, 'scores': s, 'labels': l, 'masks': m})
+
+        return results
+
+    def deploy(self):
+        self.eval()
+        self.deploy_mode = True
+        return self
+
