@@ -1,22 +1,320 @@
-task: instance_segmentation
+# ---------------------------------------------------------------
+# Modified for custom datasets with folder paths
+# ---------------------------------------------------------------
 
-evaluator:
-  type: CocoEvaluator
-  iou_types: ['bbox', 'segm']
+import json
+import torch
+from pathlib import Path
+from typing import Callable, Optional, Union, Dict, List, Tuple
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from torchvision import tv_tensors
+from torchvision.transforms.v2 import functional as F
+from pycocotools import mask as coco_mask
 
-train_dataloader:
-  dataset:
-    type: CocoDetection
-    data_root: data/coco
-    ann_file: annotations/instances_train2017.json
-    img_prefix: train2017
-    filter_empty_gt: True
-    instance_segmentation: True
 
-val_dataloader:
-  dataset:
-    type: CocoDetection
-    data_root: data/coco
-    ann_file: annotations/instances_val2017.json
-    img_prefix: val2017
-    instance_segmentation: True
+class CustomInstanceDataset(Dataset):
+    """
+    Custom dataset for instance segmentation that works with:
+    - Images in a folder
+    - COCO-format JSON annotations
+    - Custom class mappings
+    """
+    
+    def __init__(
+        self,
+        images_path: Union[str, Path],
+        annotations_path: Union[str, Path],
+        class_mapping: Optional[Dict[int, int]] = None,
+        transforms: Optional[Callable] = None,
+        img_extensions: Tuple[str, ...] = ('.jpg', '.jpeg', '.png', '.bmp'),
+        check_empty_targets: bool = True,
+    ):
+        """
+        Args:
+            images_path: Path to folder containing images
+            annotations_path: Path to COCO-format JSON annotation file
+            class_mapping: Dict mapping original class IDs to new class IDs (optional)
+            transforms: Transform function to apply to images and targets
+            img_extensions: Tuple of valid image file extensions
+            check_empty_targets: Whether to skip images with no valid annotations
+        """
+        self.images_path = Path(images_path)
+        self.annotations_path = Path(annotations_path)
+        self.class_mapping = class_mapping or {}
+        self.transforms = transforms
+        self.img_extensions = img_extensions
+        self.check_empty_targets = check_empty_targets
+        
+        # Load and parse annotations
+        self.labels_by_filename = {}
+        self.polygons_by_filename = {}
+        self.is_crowd_by_filename = {}
+        self._load_annotations()
+        
+        # Get valid image files
+        self.image_files = self._get_valid_images()
+        
+        print(f"Loaded {len(self.image_files)} images with valid annotations")
+    
+    def _load_annotations(self):
+        """Load COCO-format annotations from JSON file"""
+        with open(self.annotations_path, 'r') as f:
+            annotation_data = json.load(f)
+        
+        # Create mapping from image ID to filename
+        image_id_to_filename = {
+            img["id"]: img["file_name"] 
+            for img in annotation_data["images"]
+        }
+        
+        # Process annotations
+        for annotation in annotation_data["annotations"]:
+            img_filename = image_id_to_filename[annotation["image_id"]]
+            
+            # Initialize dictionaries for this image if not exists
+            if img_filename not in self.labels_by_filename:
+                self.labels_by_filename[img_filename] = {}
+                self.polygons_by_filename[img_filename] = {}
+                self.is_crowd_by_filename[img_filename] = {}
+            
+            # Store annotation data
+            ann_id = annotation["id"]
+            self.labels_by_filename[img_filename][ann_id] = annotation["category_id"]
+            self.polygons_by_filename[img_filename][ann_id] = annotation["segmentation"]
+            self.is_crowd_by_filename[img_filename][ann_id] = bool(annotation.get("iscrowd", 0))
+    
+    def _get_valid_images(self):
+        """Get list of valid image files that have annotations"""
+        valid_images = []
+        
+        for img_file in self.images_path.iterdir():
+            if not img_file.is_file() or img_file.suffix.lower() not in self.img_extensions:
+                continue
+            
+            filename = img_file.name
+            
+            # Check if image has annotations
+            if filename not in self.labels_by_filename:
+                if self.check_empty_targets:
+                    continue
+            
+            # Check if image has valid classes (after mapping)
+            if self.class_mapping and filename in self.labels_by_filename:
+                valid_classes = any(
+                    cls_id in self.class_mapping 
+                    for cls_id in self.labels_by_filename[filename].values()
+                )
+                if not valid_classes and self.check_empty_targets:
+                    continue
+            
+            valid_images.append(img_file)
+        
+        return sorted(valid_images)
+    
+    def _parse_targets(self, filename: str, img_width: int, img_height: int):
+        """Parse annotation data for a specific image"""
+        masks, labels, is_crowd = [], [], []
+        
+        if filename not in self.labels_by_filename:
+            return masks, labels, is_crowd
+        
+        labels_dict = self.labels_by_filename[filename]
+        polygons_dict = self.polygons_by_filename[filename]
+        is_crowd_dict = self.is_crowd_by_filename[filename]
+        
+        for ann_id, cls_id in labels_dict.items():
+            # Apply class mapping if provided
+            if self.class_mapping:
+                if cls_id not in self.class_mapping:
+                    continue
+                mapped_cls_id = self.class_mapping[cls_id]
+            else:
+                mapped_cls_id = cls_id
+            
+            # Get segmentation data
+            segmentation = polygons_dict[ann_id]
+            
+            # Convert polygons to mask
+            if isinstance(segmentation, list):
+                # Polygon format
+                rles = coco_mask.frPyObjects(segmentation, img_height, img_width)
+                rle = coco_mask.merge(rles) if len(rles) > 1 else rles[0]
+            else:
+                # RLE format
+                rle = segmentation
+            
+            # Decode mask
+            mask = coco_mask.decode(rle)
+            masks.append(tv_tensors.Mask(torch.from_numpy(mask).bool()))
+            labels.append(mapped_cls_id)
+            is_crowd.append(is_crowd_dict[ann_id])
+        
+        return masks, labels, is_crowd
+    
+    def __getitem__(self, index: int):
+        # Load image
+        img_path = self.image_files[index]
+        img = Image.open(img_path).convert("RGB")
+        img = tv_tensors.Image(img)
+        
+        # Parse targets
+        masks, labels, is_crowd = self._parse_targets(
+            img_path.name, 
+            img.shape[-1],  # width
+            img.shape[-2]   # height
+        )
+        
+        # Create target dictionary
+        if masks:
+            target = {
+                "masks": tv_tensors.Mask(torch.stack(masks)),
+                "labels": torch.tensor(labels, dtype=torch.long),
+                "is_crowd": torch.tensor(is_crowd, dtype=torch.bool),
+            }
+        else:
+            # Empty target
+            target = {
+                "masks": tv_tensors.Mask(torch.zeros((0, img.shape[-2], img.shape[-1]), dtype=torch.bool)),
+                "labels": torch.tensor([], dtype=torch.long),
+                "is_crowd": torch.tensor([], dtype=torch.bool),
+            }
+        
+        # Apply transforms
+        if self.transforms is not None:
+            img, target = self.transforms(img, target)
+        
+        return img, target
+    
+    def __len__(self):
+        return len(self.image_files)
+
+
+class CustomInstanceDataModule:
+    """
+    Data module for custom instance segmentation datasets
+    """
+    
+    def __init__(
+        self,
+        train_images_path: Union[str, Path],
+        train_annotations_path: Union[str, Path],
+        val_images_path: Union[str, Path],
+        val_annotations_path: Union[str, Path],
+        class_mapping: Optional[Dict[int, int]] = None,
+        batch_size: int = 16,
+        num_workers: int = 4,
+        img_size: Tuple[int, int] = (640, 640),
+        transforms: Optional[Callable] = None,
+        check_empty_targets: bool = True,
+    ):
+        """
+        Args:
+            train_images_path: Path to training images folder
+            train_annotations_path: Path to training annotations JSON
+            val_images_path: Path to validation images folder  
+            val_annotations_path: Path to validation annotations JSON
+            class_mapping: Dict mapping original class IDs to new class IDs
+            batch_size: Batch size for data loaders
+            num_workers: Number of worker processes for data loading
+            img_size: Target image size (height, width)
+            transforms: Transform function for training data
+            check_empty_targets: Whether to skip images with no valid annotations
+        """
+        self.train_images_path = train_images_path
+        self.train_annotations_path = train_annotations_path
+        self.val_images_path = val_images_path
+        self.val_annotations_path = val_annotations_path
+        self.class_mapping = class_mapping
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.img_size = img_size
+        self.transforms = transforms
+        self.check_empty_targets = check_empty_targets
+        
+        self.train_dataset = None
+        self.val_dataset = None
+    
+    def setup(self):
+        """Setup train and validation datasets"""
+        self.train_dataset = CustomInstanceDataset(
+            images_path=self.train_images_path,
+            annotations_path=self.train_annotations_path,
+            class_mapping=self.class_mapping,
+            transforms=self.transforms,
+            check_empty_targets=self.check_empty_targets,
+        )
+        
+        self.val_dataset = CustomInstanceDataset(
+            images_path=self.val_images_path,
+            annotations_path=self.val_annotations_path,
+            class_mapping=self.class_mapping,
+            transforms=None,  # No transforms for validation
+            check_empty_targets=self.check_empty_targets,
+        )
+        
+        return self
+    
+    def train_dataloader(self, collate_fn=None):
+        """Create training data loader"""
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            drop_last=True,
+            collate_fn=collate_fn,
+        )
+    
+    def val_dataloader(self, collate_fn=None):
+        """Create validation data loader"""
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            collate_fn=collate_fn,
+        )
+
+
+# Example usage and helper functions
+def create_coco_class_mapping():
+    """Create the COCO 80-class mapping (maps 91 COCO classes to 80 classes)"""
+    return {
+        1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7, 9: 8, 10: 9,
+        11: 10, 13: 11, 14: 12, 15: 13, 16: 14, 17: 15, 18: 16, 19: 17, 20: 18,
+        21: 19, 22: 20, 23: 21, 24: 22, 25: 23, 27: 24, 28: 25, 31: 26, 32: 27,
+        33: 28, 34: 29, 35: 30, 36: 31, 37: 32, 38: 33, 39: 34, 40: 35,
+        41: 36, 42: 37, 43: 38, 44: 39, 46: 40, 47: 41, 48: 42, 49: 43, 50: 44,
+        51: 45, 52: 46, 53: 47, 54: 48, 55: 49, 56: 50, 57: 51, 58: 52, 59: 53,
+        60: 54, 61: 55, 62: 56, 63: 57, 64: 58, 65: 59, 67: 60, 70: 61,
+        72: 62, 73: 63, 74: 64, 75: 65, 76: 66, 77: 67, 78: 68, 79: 69, 80: 70,
+        81: 71, 82: 72, 84: 73, 85: 74, 86: 75, 87: 76, 88: 77, 89: 78, 90: 79,
+    }
+
+
+# Example usage:
+if __name__ == "__main__":
+    # For COCO dataset
+    coco_mapping = create_coco_class_mapping()
+    
+    data_module = CustomInstanceDataModule(
+        train_images_path="path/to/train/images",
+        train_annotations_path="path/to/train/annotations.json",
+        val_images_path="path/to/val/images", 
+        val_annotations_path="path/to/val/annotations.json",
+        class_mapping=coco_mapping,  # Use None for custom datasets with sequential class IDs
+        batch_size=16,
+        num_workers=4,
+    )
+    
+    data_module.setup()
+    
+    train_loader = data_module.train_dataloader()
+    val_loader = data_module.val_dataloader()
+    
+    # Test loading a batch
+    for images, targets in train_loader:
+        print(f"Batch shape: {images.shape}")
+        print(f"Number of targets: {len(targets)}")
+        break
