@@ -8,6 +8,8 @@ import os
 import json
 import time
 import argparse
+import importlib
+import warnings
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
 from datetime import datetime
@@ -20,11 +22,13 @@ from ultralytics import YOLO
 from lightning.pytorch import LightningModule
 from jsonargparse import ArgumentParser
 import torchvision.transforms.v2.functional as F
+from tqdm import tqdm
 
 # Import your model classes
 from training.mask_classification_instance import MaskClassificationInstance
 from models.eomt import EoMT
 from models.vit import ViT
+from datasets.lightning_data_module import LightningDataModule
 
 
 class InferenceComparator:
@@ -65,25 +69,78 @@ class InferenceComparator:
         print("Loading EoMT model...")
         start_time = time.time()
         
-        # Parse config file
-        parser = ArgumentParser()
-        parser.add_class_arguments(MaskClassificationInstance, "model")
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*Attribute 'network' is an instance of `nn\.Module` and is already saved during checkpointing.*",
+        )
         
+        # Load config file
         with open(self.args.eomt_config, 'r') as f:
-            config_dict = yaml.safe_load(f)
+            config = yaml.safe_load(f)
         
-        # Create model from config
-        model_config = config_dict['model']
-        model_class = model_config['class_path']
-        model_args = model_config['init_args']
+        # Create data module to get img_size and num_classes
+        data_cfg = config["data"]
+        data_module_name, data_class_name = data_cfg["class_path"].rsplit(".", 1)
+        data_cls = getattr(importlib.import_module(data_module_name), data_class_name)
+        data = data_cls(**data_cfg.get("init_args", {}))
         
-        # Update checkpoint path
-        model_args['ckpt_path'] = self.args.eomt_checkpoint
+        # Load encoder
+        encoder_cfg = config["model"]["init_args"]["network"]["init_args"]["encoder"]
+        encoder_module_name, encoder_class_name = encoder_cfg["class_path"].rsplit(".", 1)
+        encoder_cls = getattr(importlib.import_module(encoder_module_name), encoder_class_name)
+        encoder = encoder_cls(img_size=data.img_size, **encoder_cfg.get("init_args", {}))
         
-        # Initialize model
-        self.eomt_model = MaskClassificationInstance(**model_args)
-        self.eomt_model.to(self.device)
-        self.eomt_model.eval()
+        # Load network
+        network_cfg = config["model"]["init_args"]["network"]
+        network_module_name, network_class_name = network_cfg["class_path"].rsplit(".", 1)
+        network_cls = getattr(importlib.import_module(network_module_name), network_class_name)
+        network_kwargs = {k: v for k, v in network_cfg["init_args"].items() if k != "encoder"}
+        network = network_cls(
+            masked_attn_enabled=False,
+            num_classes=data.num_classes,
+            encoder=encoder,
+            **network_kwargs,
+        )
+        
+        # Load Lightning module
+        lit_module_name, lit_class_name = config["model"]["class_path"].rsplit(".", 1)
+        lit_cls = getattr(importlib.import_module(lit_module_name), lit_class_name)
+        model_kwargs = {k: v for k, v in config["model"]["init_args"].items() if k != "network"}
+        if "stuff_classes" in config["data"].get("init_args", {}):
+            model_kwargs["stuff_classes"] = config["data"]["init_args"]["stuff_classes"]
+        
+        self.eomt_model = (
+            lit_cls(
+                img_size=data.img_size,
+                num_classes=data.num_classes,
+                network=network,
+                **model_kwargs,
+            )
+            .eval()
+            .to(self.device)
+        )
+        
+        # Load checkpoint weights
+        if self.args.eomt_checkpoint:
+            print(f"Loading checkpoint from {self.args.eomt_checkpoint}")
+            checkpoint = torch.load(self.args.eomt_checkpoint, map_location=self.device)
+            
+            # Handle different checkpoint formats
+            if "state_dict" in checkpoint:
+                state_dict = checkpoint["state_dict"]
+            else:
+                state_dict = checkpoint
+            
+            # Remove any keys that might cause issues
+            state_dict = {k: v for k, v in state_dict.items() if "criterion.empty_weight" not in k}
+            
+            # Load state dict
+            missing_keys, unexpected_keys = self.eomt_model.load_state_dict(state_dict, strict=False)
+            
+            if missing_keys:
+                print(f"Warning: Missing keys in checkpoint: {missing_keys}")
+            if unexpected_keys:
+                print(f"Warning: Unexpected keys in checkpoint: {unexpected_keys}")
         
         loading_time = time.time() - start_time
         self.stats['eomt']['loading_time'] = loading_time
@@ -383,10 +440,17 @@ class InferenceComparator:
             f.write(f"Confidence threshold: {self.args.confidence_threshold}\n")
             f.write(f"Total images: {len(image_paths)}\n\n")
             
-        # Process images
-        for i, image_path in enumerate(image_paths):
-            self.process_single_image(image_path, i)
-            
+        # Process images with progress bar
+        with tqdm(total=len(image_paths), desc="Processing images", unit="img") as pbar:
+            for i, image_path in enumerate(image_paths):
+                self.process_single_image(image_path, i)
+                pbar.update(1)
+                pbar.set_postfix({
+                    'Current': image_path.name,
+                    'EoMT_avg_time': f"{self.stats['eomt']['total_inference_time']/(i+1):.3f}s",
+                    'YOLO_avg_time': f"{self.stats['yolo']['total_inference_time']/(i+1):.3f}s"
+                })
+                
         self.stats['eomt']['num_images'] = len(image_paths)
         self.stats['yolo']['num_images'] = len(image_paths)
         
@@ -425,17 +489,28 @@ class InferenceComparator:
         """Run the complete comparison"""
         print("Starting model comparison...")
         
-        # Load models
-        self.load_eomt_model()
-        self.load_yolo_model()
+        # Load models with progress indication
+        print("\n[1/3] Loading models...")
+        with tqdm(total=2, desc="Loading models", unit="model") as pbar:
+            self.load_eomt_model()
+            pbar.update(1)
+            pbar.set_postfix({'Current': 'EoMT loaded'})
+            
+            self.load_yolo_model()
+            pbar.update(1)
+            pbar.set_postfix({'Current': 'YOLOv8 loaded'})
         
+        print("\n[2/3] Processing images...")
         # Process all images
         self.process_all_images()
         
+        print("\n[3/3] Saving results...")
         # Save results
-        self.save_results()
+        with tqdm(total=1, desc="Saving results", unit="step") as pbar:
+            self.save_results()
+            pbar.update(1)
         
-        print("Comparison completed!")
+        print("\nComparison completed!")
 
 
 def main():
