@@ -1316,3 +1316,86 @@ class ProductionDINOv2Classifier(nn.Module):
         plt.savefig(os.path.join(visualizer.save_dir, 'confidence_analysis.png'), 
                     dpi=150, bbox_inches='tight')
         plt.show()
+
+
+--------------------------------------------------------------------------------------
+
+import torch
+import torch.nn as nn
+import math
+
+class LoRALinear(nn.Module):
+    def __init__(self, original_layer, r=16, alpha=32, dropout=0.1):
+        super().__init__()
+        self.original_layer = original_layer
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / r
+        
+        # Freeze original weights
+        for param in self.original_layer.parameters():
+            param.requires_grad = False
+            
+        # LoRA matrices
+        self.lora_A = nn.Linear(original_layer.in_features, r, bias=False)
+        self.lora_B = nn.Linear(r, original_layer.out_features, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Initialize LoRA weights
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        
+    def forward(self, x):
+        # Original computation
+        original_out = self.original_layer(x)
+        
+        # LoRA computation: x -> A -> dropout -> B
+        lora_out = self.lora_A(x)
+        lora_out = self.dropout(lora_out)
+        lora_out = self.lora_B(lora_out)
+        
+        return original_out + (lora_out * self.scaling)
+    
+    def merge_weights(self):
+        """Merge LoRA weights into original layer for inference"""
+        if self.r > 0:
+            # Compute LoRA weight update: B @ A
+            lora_weight = (self.lora_B.weight @ self.lora_A.weight) * self.scaling
+            
+            # Add to original weights
+            self.original_layer.weight.data += lora_weight
+            
+            # Zero out LoRA weights to avoid double-counting
+            self.lora_A.weight.data.zero_()
+            self.lora_B.weight.data.zero_()
+
+
+
+----------------------------------------------------------------------
+
+def apply_lora_to_dinov2(model, r=16, alpha=32, target_modules=None):
+    """Apply LoRA to DINOv2 attention layers"""
+    if target_modules is None:
+        target_modules = ['qkv', 'proj']  # Query/Key/Value and output projection
+    
+    lora_modules = {}
+    
+    def apply_lora_recursive(module, name=""):
+        for child_name, child_module in module.named_children():
+            full_name = f"{name}.{child_name}" if name else child_name
+            
+            # Apply LoRA to target linear layers
+            if isinstance(child_module, nn.Linear) and any(target in full_name for target in target_modules):
+                lora_layer = LoRALinear(child_module, r=r, alpha=alpha)
+                setattr(module, child_name, lora_layer)
+                lora_modules[full_name] = lora_layer
+                print(f"Applied LoRA to: {full_name}")
+            else:
+                apply_lora_recursive(child_module, full_name)
+    
+    apply_lora_recursive(model)
+    return lora_modules
+
+# Usage
+dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+lora_modules = apply_lora_to_dinov2(dinov2, r=16, alpha=32)
