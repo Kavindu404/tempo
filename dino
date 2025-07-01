@@ -1,0 +1,1048 @@
+import json
+import os
+from PIL import Image
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from collections import defaultdict
+import matplotlib.pyplot as plt
+
+class COCOClassificationDataset(Dataset):
+    def __init__(self, annotation_file, image_dir, transform=None, min_bbox_area=100):
+        """
+        COCO dataset for classification from bboxes
+        
+        Args:
+            annotation_file: Path to COCO JSON file
+            image_dir: Directory containing images
+            transform: Image transforms
+            min_bbox_area: Minimum bbox area to include
+        """
+        with open(annotation_file, 'r') as f:
+            self.coco_data = json.load(f)
+        
+        self.image_dir = image_dir
+        self.transform = transform
+        self.min_bbox_area = min_bbox_area
+        
+        # Build mappings
+        self.images = {img['id']: img for img in self.coco_data['images']}
+        self.categories = {cat['id']: cat for cat in self.coco_data['categories']}
+        
+        # Create category_id to index mapping for model
+        self.category_ids = sorted(list(self.categories.keys()))
+        self.cat_id_to_idx = {cat_id: idx for idx, cat_id in enumerate(self.category_ids)}
+        self.idx_to_cat_id = {idx: cat_id for cat_id, idx in self.cat_id_to_idx.items()}
+        
+        # Filter valid annotations
+        self.annotations = self._filter_annotations()
+        
+        print(f"Loaded {len(self.annotations)} annotations for {len(self.category_ids)} categories")
+        self._print_category_stats()
+    
+    def _filter_annotations(self):
+        """Filter annotations based on bbox area and validity"""
+        valid_annotations = []
+        
+        for ann in self.coco_data['annotations']:
+            # Check if image exists
+            if ann['image_id'] not in self.images:
+                continue
+            
+            # Check bbox area
+            bbox = ann['bbox']  # [x, y, width, height]
+            area = bbox[2] * bbox[3]
+            if area < self.min_bbox_area:
+                continue
+            
+            # Check if category exists
+            if ann['category_id'] not in self.categories:
+                continue
+            
+            valid_annotations.append(ann)
+        
+        return valid_annotations
+    
+    def _print_category_stats(self):
+        """Print dataset statistics"""
+        category_counts = defaultdict(int)
+        for ann in self.annotations:
+            category_counts[ann['category_id']] += 1
+        
+        print("\nCategory distribution:")
+        for cat_id in self.category_ids:
+            cat_name = self.categories[cat_id]['name']
+            count = category_counts[cat_id]
+            print(f"  {cat_name}: {count} samples")
+    
+    def __len__(self):
+        return len(self.annotations)
+    
+    def __getitem__(self, idx):
+        ann = self.annotations[idx]
+        
+        # Load image
+        image_info = self.images[ann['image_id']]
+        image_path = os.path.join(self.image_dir, image_info['file_name'])
+        image = Image.open(image_path).convert('RGB')
+        
+        # Crop bbox
+        bbox = ann['bbox']  # [x, y, width, height]
+        x, y, w, h = bbox
+        cropped_image = image.crop((x, y, x + w, y + h))
+        
+        # Apply transforms
+        if self.transform:
+            cropped_image = self.transform(cropped_image)
+        
+        # Convert category_id to model index
+        category_idx = self.cat_id_to_idx[ann['category_id']]
+        
+        return cropped_image, category_idx, ann['category_id'], ann['id']
+    
+    def get_class_names(self):
+        """Get class names in model index order"""
+        return [self.categories[cat_id]['name'] for cat_id in self.category_ids]
+
+def create_transforms(image_size=224, is_training=True):
+    """Create transforms for DINOv2"""
+    if is_training:
+        transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    else:
+        transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    
+    return transform
+
+
+
+
+
+
+
+-----------------------------------------------------------------------------------------------------------------------------------
+
+import numpy as np
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+
+class TrainingTracker:
+    def __init__(self, save_dir='./training_logs'):
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Track metrics
+        self.train_losses = []
+        self.val_losses = []
+        self.val_accuracies = []
+        self.learning_rates = []
+        self.epoch_times = []
+        
+    def update(self, epoch, train_loss, val_loss, val_acc, lr, epoch_time):
+        self.train_losses.append(train_loss)
+        self.val_losses.append(val_loss)
+        self.val_accuracies.append(val_acc)
+        self.learning_rates.append(lr)
+        self.epoch_times.append(epoch_time)
+        
+    def plot_training_curves(self):
+        """Plot and save training curves"""
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        
+        epochs = range(1, len(self.train_losses) + 1)
+        
+        # Loss curves
+        axes[0, 0].plot(epochs, self.train_losses, 'b-', label='Train Loss', linewidth=2)
+        axes[0, 0].plot(epochs, self.val_losses, 'r-', label='Val Loss', linewidth=2)
+        axes[0, 0].set_title('Training and Validation Loss')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Accuracy curve
+        axes[0, 1].plot(epochs, self.val_accuracies, 'g-', linewidth=2)
+        axes[0, 1].set_title('Validation Accuracy')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Accuracy')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Learning rate
+        axes[1, 0].plot(epochs, self.learning_rates, 'orange', linewidth=2)
+        axes[1, 0].set_title('Learning Rate Schedule')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Learning Rate')
+        axes[1, 0].set_yscale('log')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Training time
+        axes[1, 1].plot(epochs, self.epoch_times, 'm-', linewidth=2)
+        axes[1, 1].set_title('Training Time per Epoch')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Time (seconds)')
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, 'training_curves.png'), 
+                    dpi=150, bbox_inches='tight')
+        plt.show()
+        
+    def save_metrics(self):
+        """Save metrics to JSON"""
+        metrics = {
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'val_accuracies': self.val_accuracies,
+            'learning_rates': self.learning_rates,
+            'epoch_times': self.epoch_times,
+            'best_val_acc': max(self.val_accuracies),
+            'best_epoch': np.argmax(self.val_accuracies) + 1
+        }
+        
+        with open(os.path.join(self.save_dir, 'training_metrics.json'), 'w') as f:
+            json.dump(metrics, f, indent=2)
+
+def train_coco_classifier(model, train_loader, val_loader, epochs=50, lr=1e-4, 
+                         class_names=None, visualize_cls_every=100):
+    """Train classifier with comprehensive tracking"""
+    
+    tracker = TrainingTracker()
+    visualizer = CLSVisualizer(class_names=class_names) if class_names else None
+    
+    optimizer = torch.optim.AdamW(model.get_lora_parameters(), lr=lr, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
+    criterion = nn.CrossEntropyLoss()
+    
+    best_val_acc = 0
+    best_model_state = None
+    
+    for epoch in range(epochs):
+        start_time = time.time()
+        
+        # Training phase
+        model.train()
+        train_loss = 0
+        train_samples = 0
+        
+        for batch_idx, (data, labels, category_ids, ann_ids) in enumerate(train_loader):
+            data, labels = data.cuda(), labels.cuda()
+            
+            optimizer.zero_grad()
+            
+            # Forward pass
+            if visualizer and batch_idx % visualize_cls_every == 0:
+                outputs, cls_features = model(data, return_cls=True)
+                
+                # Visualize CLS tokens
+                with torch.no_grad():
+                    predictions = torch.argmax(outputs, dim=1)
+                    vis_size = min(64, data.size(0))
+                    
+                    visualizer.visualize_cls_tokens(
+                        cls_features[:vis_size],
+                        labels[:vis_size],
+                        predictions[:vis_size],
+                        epoch=epoch,
+                        batch_idx=batch_idx
+                    )
+            else:
+                outputs = model(data)
+            
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item() * data.size(0)
+            train_samples += data.size(0)
+            
+            if batch_idx % 50 == 0:
+                current_lr = scheduler.get_last_lr()[0]
+                print(f'Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}, LR: {current_lr:.6f}')
+        
+        # Validation phase
+        val_loss, val_acc, val_cls_features, val_labels, val_preds = validate_coco_classifier(
+            model, val_loader, criterion
+        )
+        
+        scheduler.step()
+        epoch_time = time.time() - start_time
+        
+        # Update tracking
+        avg_train_loss = train_loss / train_samples
+        current_lr = scheduler.get_last_lr()[0]
+        tracker.update(epoch, avg_train_loss, val_loss, val_acc, current_lr, epoch_time)
+        
+        print(f'Epoch {epoch}: Train Loss: {avg_train_loss:.4f}, '
+              f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, Time: {epoch_time:.1f}s')
+        
+        # Save best model
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model_state = model.state_dict().copy()
+            print(f'New best validation accuracy: {best_val_acc:.4f}')
+        
+        # Visualize validation CLS tokens
+        if visualizer and epoch % 5 == 0:
+            visualizer.visualize_cls_tokens(
+                val_cls_features[:200],  # Subset for clarity
+                val_labels[:200],
+                val_preds[:200],
+                epoch=epoch,
+                method='tsne'
+            )
+        
+        # Plot training curves every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            tracker.plot_training_curves()
+    
+    # Final plots and save
+    tracker.plot_training_curves()
+    tracker.save_metrics()
+    
+    # Load best model
+    if best_model_state:
+        model.load_state_dict(best_model_state)
+        print(f'Loaded best model with validation accuracy: {best_val_acc:.4f}')
+    
+    return model, tracker
+
+def validate_coco_classifier(model, val_loader, criterion):
+    """Validation with detailed metrics"""
+    model.eval()
+    val_loss = 0
+    correct = 0
+    total = 0
+    
+    all_cls_features = []
+    all_labels = []
+    all_predictions = []
+    
+    with torch.no_grad():
+        for data, labels, category_ids, ann_ids in val_loader:
+            data, labels = data.cuda(), labels.cuda()
+            
+            outputs, cls_features = model(data, return_cls=True)
+            loss = criterion(outputs, labels)
+            
+            val_loss += loss.item() * data.size(0)
+            
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            
+            # Collect for analysis
+            all_cls_features.append(cls_features.cpu())
+            all_labels.append(labels.cpu())
+            all_predictions.append(predicted.cpu())
+    
+    model.train()
+    
+    # Concatenate results
+    all_cls_features = torch.cat(all_cls_features)
+    all_labels = torch.cat(all_labels)
+    all_predictions = torch.cat(all_predictions)
+    
+    avg_val_loss = val_loss / total
+    accuracy = correct / total
+    
+    return avg_val_loss, accuracy, all_cls_features, all_labels, all_predictions
+
+
+
+----------------------------------------------------------------------------------------------------------------------------
+
+
+
+class COCOClassificationEvaluator:
+    def __init__(self, class_names, save_dir='./evaluation'):
+        self.class_names = class_names
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        
+    def evaluate_model(self, model, test_loader, dataset):
+        """Comprehensive model evaluation"""
+        print("Starting comprehensive evaluation...")
+        
+        model.eval()
+        all_predictions = []
+        all_labels = []
+        all_category_ids = []
+        all_ann_ids = []
+        all_cls_features = []
+        all_confidences = []
+        
+        with torch.no_grad():
+            for data, labels, category_ids, ann_ids in test_loader:
+                data = data.cuda()
+                
+                outputs, cls_features = model(data, return_cls=True)
+                probs = torch.softmax(outputs, dim=1)
+                predictions = torch.argmax(outputs, dim=1)
+                confidences = torch.max(probs, dim=1)[0]
+                
+                all_predictions.extend(predictions.cpu().numpy())
+                all_labels.extend(labels.numpy())
+                all_category_ids.extend(category_ids.numpy())
+                all_ann_ids.extend(ann_ids.numpy())
+                all_cls_features.append(cls_features.cpu())
+                all_confidences.extend(confidences.cpu().numpy())
+        
+        # Convert to arrays
+        all_predictions = np.array(all_predictions)
+        all_labels = np.array(all_labels)
+        all_category_ids = np.array(all_category_ids)
+        all_confidences = np.array(all_confidences)
+        all_cls_features = torch.cat(all_cls_features)
+        
+        # Calculate metrics
+        results = self._calculate_metrics(all_labels, all_predictions, all_confidences)
+        
+        # Generate reports
+        self._generate_classification_report(all_labels, all_predictions)
+        self._plot_confusion_matrix(all_labels, all_predictions)
+        self._plot_confidence_distribution(all_confidences, all_labels, all_predictions)
+        self._analyze_per_category_performance(all_labels, all_predictions, 
+                                             all_category_ids, dataset)
+        
+        # CLS token analysis
+        self._analyze_cls_representations(all_cls_features, all_labels, all_predictions)
+        
+        # Save detailed results
+        self._save_detailed_results(results, all_predictions, all_labels, 
+                                   all_category_ids, all_ann_ids, all_confidences)
+        
+        return results
+    
+    def _calculate_metrics(self, labels, predictions, confidences):
+        """Calculate comprehensive metrics"""
+        from sklearn.metrics import accuracy_score, precision_recall_fscore_support, top_k_accuracy_score
+        
+        accuracy = accuracy_score(labels, predictions)
+        precision, recall, f1, support = precision_recall_fscore_support(
+            labels, predictions, average='weighted'
+        )
+        
+        # Per-class metrics
+        per_class_precision, per_class_recall, per_class_f1, per_class_support = \
+            precision_recall_fscore_support(labels, predictions, average=None)
+        
+        # Confidence statistics
+        correct_mask = labels == predictions
+        correct_confidences = confidences[correct_mask]
+        incorrect_confidences = confidences[~correct_mask]
+        
+        results = {
+            'accuracy': accuracy,
+            'weighted_precision': precision,
+            'weighted_recall': recall,
+            'weighted_f1': f1,
+            'per_class_metrics': {
+                'precision': per_class_precision.tolist(),
+                'recall': per_class_recall.tolist(),
+                'f1': per_class_f1.tolist(),
+                'support': per_class_support.tolist()
+            },
+            'confidence_stats': {
+                'mean_confidence_correct': float(np.mean(correct_confidences)),
+                'mean_confidence_incorrect': float(np.mean(incorrect_confidences)),
+                'std_confidence_correct': float(np.std(correct_confidences)),
+                'std_confidence_incorrect': float(np.std(incorrect_confidences))
+            }
+        }
+        
+        return results
+    
+    def _generate_classification_report(self, labels, predictions):
+        """Generate and save classification report"""
+        report = classification_report(labels, predictions, 
+                                     target_names=self.class_names,
+                                     output_dict=True)
+        
+        # Save text report
+        with open(os.path.join(self.save_dir, 'classification_report.txt'), 'w') as f:
+            f.write(classification_report(labels, predictions, 
+                                        target_names=self.class_names))
+        
+        # Save JSON report
+        with open(os.path.join(self.save_dir, 'classification_report.json'), 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        print("Classification Report:")
+        print(classification_report(labels, predictions, target_names=self.class_names))
+    
+    def _plot_confusion_matrix(self, labels, predictions):
+        """Plot and save confusion matrix"""
+        cm = confusion_matrix(labels, predictions)
+        
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                   xticklabels=self.class_names,
+                   yticklabels=self.class_names)
+        plt.title('Confusion Matrix')
+        plt.xlabel('Predicted')
+        plt.ylabel('Actual')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, 'confusion_matrix.png'), 
+                   dpi=150, bbox_inches='tight')
+        plt.show()
+        
+        # Normalized confusion matrix
+        cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(cm_norm, annot=True, fmt='.3f', cmap='Blues',
+                   xticklabels=self.class_names,
+                   yticklabels=self.class_names)
+        plt.title('Normalized Confusion Matrix')
+        plt.xlabel('Predicted')
+        plt.ylabel('Actual')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, 'confusion_matrix_normalized.png'), 
+                   dpi=150, bbox_inches='tight')
+        plt.show()
+    
+    def _plot_confidence_distribution(self, confidences, labels, predictions):
+        """Plot confidence distribution analysis"""
+        correct_mask = labels == predictions
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Overall confidence distribution
+        axes[0, 0].hist(confidences[correct_mask], bins=30, alpha=0.7, 
+                       label='Correct', color='green')
+        axes[0, 0].hist(confidences[~correct_mask], bins=30, alpha=0.7, 
+                       label='Incorrect', color='red')
+        axes[0, 0].set_title('Confidence Distribution')
+        axes[0, 0].set_xlabel('Confidence')
+        axes[0, 0].set_ylabel('Count')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Accuracy vs confidence
+        conf_bins = np.linspace(0, 1, 11)
+        accuracies = []
+        bin_centers = []
+        
+        for i in range(len(conf_bins) - 1):
+            mask = (confidences >= conf_bins[i]) & (confidences < conf_bins[i + 1])
+            if mask.sum() > 0:
+                acc = (labels[mask] == predictions[mask]).mean()
+                accuracies.append(acc)
+                bin_centers.append((conf_bins[i] + conf_bins[i + 1]) / 2)
+        
+        axes[0, 1].plot(bin_centers, accuracies, 'bo-', linewidth=2, markersize=8)
+        axes[0, 1].plot([0, 1], [0, 1], 'r--', alpha=0.7, label='Perfect Calibration')
+        axes[0, 1].set_title('Accuracy vs Confidence')
+        axes[0, 1].set_xlabel('Confidence')
+        axes[0, 1].set_ylabel('Accuracy')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Per-class confidence
+        unique_labels = np.unique(labels)
+        for label in unique_labels:
+            mask = labels == label
+            correct_class_mask = mask & correct_mask
+            incorrect_class_mask = mask & ~correct_mask
+            
+            if correct_class_mask.sum() > 0:
+                axes[1, 0].hist(confidences[correct_class_mask], bins=20, alpha=0.5,
+                               label=f'{self.class_names[label]} (Correct)')
+        
+        axes[1, 0].set_title('Per-Class Confidence (Correct Predictions)')
+        axes[1, 0].set_xlabel('Confidence')
+        axes[1, 0].set_ylabel('Count')
+        axes[1, 0].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        
+        # Confidence statistics by class
+        class_conf_means = []
+        class_conf_stds = []
+        for label in unique_labels:
+            mask = (labels == label) & correct_mask
+            if mask.sum() > 0:
+                class_conf_means.append(confidences[mask].mean())
+                class_conf_stds.append(confidences[mask].std())
+            else:
+                class_conf_means.append(0)
+                class_conf_stds.append(0)
+        
+        x_pos = np.arange(len(self.class_names))
+        axes[1, 1].bar(x_pos, class_conf_means, yerr=class_conf_stds, 
+                       capsize=5, alpha=0.7)
+        axes[1, 1].set_title('Mean Confidence by Class (Correct Predictions)')
+        axes[1, 1].set_xlabel('Class')
+        axes[1, 1].set_ylabel('Mean Confidence')
+        axes[1, 1].set_xticks(x_pos)
+        axes[1, 1].set_xticklabels(self.class_names, rotation=45, ha='right')
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, 'confidence_analysis.png'), 
+                   dpi=150, bbox_inches='tight')
+        plt.show()
+    
+    def _analyze_per_category_performance(self, labels, predictions, category_ids, dataset):
+        """Analyze performance per COCO category"""
+        # Map back to original category IDs
+        unique_labels = np.unique(labels)
+        
+        category_performance = {}
+        for label in unique_labels:
+            mask = labels == label
+            cat_id = dataset.idx_to_cat_id[label]
+            cat_name = self.class_names[label]
+            
+            total = mask.sum()
+            correct = (predictions[mask] == labels[mask]).sum()
+            accuracy = correct / total if total > 0 else 0
+            
+            category_performance[cat_id] = {
+                'name': cat_name,
+                'total_samples': int(total),
+                'correct_predictions': int(correct),
+                'accuracy': float(accuracy)
+            }
+        
+        # Save category performance
+        with open(os.path.join(self.save_dir, 'category_performance.json'), 'w') as f:
+            json.dump(category_performance, f, indent=2)
+        
+        # Plot category performance
+        categories = [category_performance[cat_id]['name'] for cat_id in sorted(category_performance.keys())]
+        accuracies = [category_performance[cat_id]['accuracy'] for cat_id in sorted(category_performance.keys())]
+        sample_counts = [category_performance[cat_id]['total_samples'] for cat_id in sorted(category_performance.keys())]
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
+        
+        # Accuracy by category
+        bars = ax1.bar(categories, accuracies, alpha=0.7)
+        ax1.set_title('Accuracy by Category')
+        ax1.set_ylabel('Accuracy')
+        ax1.set_ylim(0, 1)
+        ax1.tick_params(axis='x', rotation=45)
+        ax1.grid(True, alpha=0.3)
+        
+        # Add value labels on bars
+        for bar, acc in zip(bars, accuracies):
+            ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                    f'{acc:.3f}', ha='center', va='bottom')
+        
+        # Sample count by category
+        ax2.bar(categories, sample_counts, alpha=0.7, color='orange')
+        ax2.set_title('Sample Count by Category')
+        ax2.set_ylabel('Number of Samples')
+        ax2.tick_params(axis='x', rotation=45)
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, 'category_performance.png'), 
+                   dpi=150, bbox_inches='tight')
+        plt.show()
+    
+    def _analyze_cls_representations(self, cls_features, labels, predictions):
+        """Analyze CLS token representations"""
+        visualizer = CLSVisualizer(class_names=self.class_names, save_dir=self.save_dir)
+        
+        # Overall CLS visualization
+        visualizer.visualize_cls_tokens(cls_features, labels, predictions)
+        
+        # Confidence-based analysis
+        # This would be similar to the production model analysis
+        print("CLS token analysis saved to visualization directory")
+    
+    def _save_detailed_results(self, metrics, predictions, labels, category_ids, 
+                              ann_ids, confidences):
+        """Save detailed prediction results"""
+        detailed_results = {
+            'metrics': metrics,
+            'predictions': {
+                'annotation_ids': ann_ids.tolist(),
+                'category_ids': category_ids.tolist(),
+                'predicted_labels': predictions.tolist(),
+                'true_labels': labels.tolist(),
+                'confidences': confidences.tolist()
+            }
+        }
+        
+        with open(os.path.join(self.save_dir, 'detailed_results.json'), 'w') as f:
+            json.dump(detailed_results, f, indent=2)
+        
+        print(f"Detailed results saved to {self.save_dir}")
+        
+
+---------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+import time
+
+def main():
+    # Dataset setup
+    train_dataset = COCOClassificationDataset(
+        annotation_file='path/to/train_annotations.json',
+        image_dir='path/to/train_images/',
+        transform=create_transforms(is_training=True),
+        min_bbox_area=100
+    )
+    
+    val_dataset = COCOClassificationDataset(
+        annotation_file='path/to/val_annotations.json',
+        image_dir='path/to/val_images/',
+        transform=create_transforms(is_training=False)
+    )
+    
+    test_dataset = COCOClassificationDataset(
+        annotation_file='path/to/test_annotations.json',
+        image_dir='path/to/test_images/',
+        transform=create_transforms(is_training=False)
+    )
+    
+    # Data loaders
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=4)
+    
+    # Model setup
+    num_classes = len(train_dataset.category_ids)
+    class_names = train_dataset.get_class_names()
+    
+	model = DINOv2LoRAClassifier(num_classes, r=16, alpha=32).cuda()
+   
+    print(f"Training model with {num_classes} classes: {class_names}")
+    print_model_stats(model)
+   
+    # Training
+    print("Starting training...")
+    trained_model, tracker = train_coco_classifier(
+	    model, train_loader, val_loader, 
+	    epochs=50, 
+	    lr=1e-4,
+	    class_names=class_names,
+	    visualize_cls_every=100
+    )
+   
+    # Save trained model
+    trained_model.merge_and_save('coco_classifier_final.pth')
+   
+    # Load for evaluation (simulating production scenario)
+    production_model = ProductionDINOv2Classifier.from_lora_checkpoint('coco_classifier_final.pth')
+    production_model.cuda()
+   
+    # Comprehensive evaluation
+    print("Starting comprehensive evaluation...")
+    evaluator = COCOClassificationEvaluator(class_names)
+    results = evaluator.evaluate_model(production_model, test_loader, test_dataset)
+   
+    # Print final results
+    print("\n" + "="*50)
+    print("FINAL EVALUATION RESULTS")
+    print("="*50)
+    print(f"Test Accuracy: {results['accuracy']:.4f}")
+    print(f"Weighted F1-Score: {results['weighted_f1']:.4f}")
+    print(f"Weighted Precision: {results['weighted_precision']:.4f}")
+    print(f"Weighted Recall: {results['weighted_recall']:.4f}")
+   
+    print("\nPer-class F1 scores:")
+    for i, (class_name, f1) in enumerate(zip(class_names, results['per_class_metrics']['f1'])):
+	    support = results['per_class_metrics']['support'][i]
+	    print(f"  {class_name}: {f1:.4f} (n={support})")
+   
+    print(f"\nConfidence Statistics:")
+    print(f"  Mean confidence (correct): {results['confidence_stats']['mean_confidence_correct']:.4f}")
+    print(f"  Mean confidence (incorrect): {results['confidence_stats']['mean_confidence_incorrect']:.4f}")
+
+if __name__ == "__main__":
+   main()
+    
+
+---------------------------------------------------------------------------------------------------------------------------------------
+
+
+def analyze_bbox_sizes(annotation_file, image_dir):
+    """Analyze bbox size distribution in your dataset"""
+    with open(annotation_file, 'r') as f:
+        coco_data = json.load(f)
+    
+    bbox_areas = []
+    bbox_aspect_ratios = []
+    
+    for ann in coco_data['annotations']:
+        bbox = ann['bbox']  # [x, y, width, height]
+        w, h = bbox[2], bbox[3]
+        area = w * h
+        aspect_ratio = w / h if h > 0 else 0
+        
+        bbox_areas.append(area)
+        bbox_aspect_ratios.append(aspect_ratio)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+    
+    # Area distribution
+    axes[0].hist(bbox_areas, bins=50, alpha=0.7)
+    axes[0].set_xlabel('Bbox Area (pixels²)')
+    axes[0].set_ylabel('Count')
+    axes[0].set_title('Bbox Area Distribution')
+    axes[0].set_yscale('log')
+    axes[0].grid(True, alpha=0.3)
+    
+    # Aspect ratio distribution
+    axes[1].hist(bbox_aspect_ratios, bins=50, alpha=0.7)
+    axes[1].set_xlabel('Aspect Ratio (W/H)')
+    axes[1].set_ylabel('Count')
+    axes[1].set_title('Bbox Aspect Ratio Distribution')
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print(f"Area statistics:")
+    print(f"  Mean: {np.mean(bbox_areas):.1f}")
+    print(f"  Median: {np.median(bbox_areas):.1f}")
+    print(f"  Min: {np.min(bbox_areas):.1f}")
+    print(f"  Max: {np.max(bbox_areas):.1f}")
+    
+    print(f"\nAspect ratio statistics:")
+    print(f"  Mean: {np.mean(bbox_aspect_ratios):.2f}")
+    print(f"  Median: {np.median(bbox_aspect_ratios):.2f}")
+
+def create_data_splits(annotation_file, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15):
+    """Split COCO annotations into train/val/test"""
+    with open(annotation_file, 'r') as f:
+        coco_data = json.load(f)
+    
+    # Group annotations by image_id
+    image_annotations = defaultdict(list)
+    for ann in coco_data['annotations']:
+        image_annotations[ann['image_id']].append(ann)
+    
+    # Split images
+    image_ids = list(image_annotations.keys())
+    np.random.shuffle(image_ids)
+    
+    n_train = int(len(image_ids) * train_ratio)
+    n_val = int(len(image_ids) * val_ratio)
+    
+    train_image_ids = set(image_ids[:n_train])
+    val_image_ids = set(image_ids[n_train:n_train + n_val])
+    test_image_ids = set(image_ids[n_train + n_val:])
+    
+    # Create splits
+    splits = {
+        'train': {'images': [], 'annotations': []},
+        'val': {'images': [], 'annotations': []},
+        'test': {'images': [], 'annotations': []}
+    }
+    
+    # Add images and annotations to splits
+    for img in coco_data['images']:
+        img_id = img['id']
+        if img_id in train_image_ids:
+            splits['train']['images'].append(img)
+            splits['train']['annotations'].extend(image_annotations[img_id])
+        elif img_id in val_image_ids:
+            splits['val']['images'].append(img)
+            splits['val']['annotations'].extend(image_annotations[img_id])
+        elif img_id in test_image_ids:
+            splits['test']['images'].append(img)
+            splits['test']['annotations'].extend(image_annotations[img_id])
+    
+    # Save splits
+    for split_name, split_data in splits.items():
+        output_data = {
+            'images': split_data['images'],
+            'annotations': split_data['annotations'],
+            'categories': coco_data['categories']
+        }
+        
+        with open(f'{split_name}_annotations.json', 'w') as f:
+            json.dump(output_data, f)
+        
+        print(f"{split_name}: {len(split_data['images'])} images, {len(split_data['annotations'])} annotations")
+
+def visualize_sample_crops(dataset, num_samples=16):
+    """Visualize sample crops from the dataset"""
+    fig, axes = plt.subplots(4, 4, figsize=(12, 12))
+    axes = axes.flatten()
+    
+    # Get random samples
+    indices = np.random.choice(len(dataset), num_samples, replace=False)
+    
+    for i, idx in enumerate(indices):
+        # Get sample (without transform for visualization)
+        dataset_no_transform = COCOClassificationDataset(
+            dataset.annotation_file, dataset.image_dir, transform=None
+        )
+        
+        image, label, category_id, ann_id = dataset_no_transform[idx]
+        class_name = dataset.categories[category_id]['name']
+        
+        axes[i].imshow(image)
+        axes[i].set_title(f'{class_name}\n(ID: {category_id})', fontsize=10)
+        axes[i].axis('off')
+    
+    plt.tight_layout()
+    plt.suptitle('Sample Cropped Images from Dataset', y=1.02, fontsize=14)
+    plt.show()
+
+def export_predictions_to_coco_format(predictions, ann_ids, category_ids, output_file):
+    """Export predictions in COCO results format"""
+    results = []
+    
+    for pred, ann_id, cat_id in zip(predictions, ann_ids, category_ids):
+        results.append({
+            'annotation_id': int(ann_id),
+            'category_id': int(cat_id),
+            'predicted_category_id': int(pred),
+            'score': 1.0  # You can add confidence scores here
+        })
+    
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"Predictions exported to {output_file}")
+
+# Error analysis functions
+def analyze_classification_errors(model, test_loader, class_names, num_errors=50):
+    """Analyze classification errors in detail"""
+    model.eval()
+    errors = []
+    
+    with torch.no_grad():
+        for data, labels, category_ids, ann_ids in test_loader:
+            data, labels = data.cuda(), labels.cuda()
+            outputs, cls_features = model(data, return_cls=True)
+            
+            probs = torch.softmax(outputs, dim=1)
+            predictions = torch.argmax(outputs, dim=1)
+            confidences = torch.max(probs, dim=1)[0]
+            
+            # Find errors
+            error_mask = predictions != labels
+            if error_mask.sum() > 0:
+                for i in range(len(data)):
+                    if error_mask[i]:
+                        errors.append({
+                            'ann_id': ann_ids[i].item(),
+                            'true_label': labels[i].item(),
+                            'pred_label': predictions[i].item(),
+                            'confidence': confidences[i].item(),
+                            'cls_features': cls_features[i].cpu(),
+                            'image': data[i].cpu()
+                        })
+            
+            if len(errors) >= num_errors:
+                break
+    
+    # Sort by confidence (most confident errors first)
+    errors.sort(key=lambda x: x['confidence'], reverse=True)
+    
+    # Visualize top errors
+    fig, axes = plt.subplots(5, 10, figsize=(20, 10))
+    axes = axes.flatten()
+    
+    for i in range(min(50, len(errors))):
+        error = errors[i]
+        
+        # Denormalize image for visualization
+        img = error['image'].permute(1, 2, 0)
+        img = img * torch.tensor([0.229, 0.224, 0.225]) + torch.tensor([0.485, 0.456, 0.406])
+        img = torch.clamp(img, 0, 1)
+        
+        axes[i].imshow(img)
+        axes[i].set_title(f'True: {class_names[error["true_label"]]}\n'
+                         f'Pred: {class_names[error["pred_label"]]}\n'
+                         f'Conf: {error["confidence"]:.3f}', fontsize=8)
+        axes[i].axis('off')
+    
+    plt.tight_layout()
+    plt.suptitle('Most Confident Classification Errors', y=1.02, fontsize=16)
+    plt.show()
+    
+    return errors
+
+def compute_per_class_metrics_detailed(labels, predictions, class_names):
+    """Compute detailed per-class metrics"""
+    from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+    
+    # Per-class metrics
+    precision, recall, f1, support = precision_recall_fscore_support(
+        labels, predictions, average=None, zero_division=0
+    )
+    
+    # Confusion matrix for detailed analysis
+    cm = confusion_matrix(labels, predictions)
+    
+    print("\nDetailed Per-Class Metrics:")
+    print("-" * 80)
+    print(f"{'Class':<20} {'Precision':<10} {'Recall':<10} {'F1-Score':<10} {'Support':<10}")
+    print("-" * 80)
+    
+    for i, class_name in enumerate(class_names):
+        print(f"{class_name:<20} {precision[i]:<10.4f} {recall[i]:<10.4f} "
+              f"{f1[i]:<10.4f} {support[i]:<10}")
+    
+    # Find most confused pairs
+    print("\nMost Confused Class Pairs:")
+    print("-" * 50)
+    
+    conf_pairs = []
+    for i in range(len(class_names)):
+        for j in range(len(class_names)):
+            if i != j and cm[i, j] > 0:
+                conf_pairs.append((cm[i, j], class_names[i], class_names[j]))
+    
+    conf_pairs.sort(reverse=True)
+    for count, true_class, pred_class in conf_pairs[:10]:
+        print(f"{true_class} -> {pred_class}: {count} errors")
+        
+        
+--------------------------------------------------------------------------------------------------------
+
+
+# Example usage
+if __name__ == "__main__":
+    # First, analyze your data
+    print("Analyzing dataset statistics...")
+    analyze_bbox_sizes('annotations.json', 'images/')
+    
+    # Create splits if needed
+    print("Creating data splits...")
+    create_data_splits('annotations.json')
+    
+    # Run the main training and evaluation pipeline
+    main()
+    
+    # Additional analysis
+    print("Performing error analysis...")
+    production_model = ProductionDINOv2Classifier.from_lora_checkpoint('coco_classifier_final.pth')
+    
+    # Load test data
+    test_dataset = COCOClassificationDataset(
+        'test_annotations.json', 'images/', 
+        transform=create_transforms(is_training=False)
+    )
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    
+    # Error analysis
+    errors = analyze_classification_errors(production_model, test_loader, 
+                                         test_dataset.get_class_names())
+    
+    # Export predictions
+    # ... (run inference to get predictions)
+    # export_predictions_to_coco_format(predictions, ann_ids, category_ids, 'predictions.json')
+    
+    
+-------------------------------------------------------------------------------------------------------
