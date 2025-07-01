@@ -1,0 +1,1757 @@
+import torch
+import torch.nn as nn
+import math
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+import cv2
+
+class LoRALinear(nn.Module):
+    def __init__(self, original_layer, r=16, alpha=32, dropout=0.1):
+        super().__init__()
+        self.original_layer = original_layer
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / r
+        
+        # Freeze original weights
+        for param in self.original_layer.parameters():
+            param.requires_grad = False
+            
+        # LoRA matrices
+        self.lora_A = nn.Linear(original_layer.in_features, r, bias=False)
+        self.lora_B = nn.Linear(r, original_layer.out_features, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Initialize LoRA weights
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        
+    def forward(self, x):
+        original_out = self.original_layer(x)
+        lora_out = self.lora_A(x)
+        lora_out = self.dropout(lora_out)
+        lora_out = self.lora_B(lora_out)
+        return original_out + (lora_out * self.scaling)
+    
+    def merge_weights(self):
+        """Merge LoRA weights into original layer for inference"""
+        if self.r > 0:
+            lora_weight = (self.lora_B.weight @ self.lora_A.weight) * self.scaling
+            self.original_layer.weight.data += lora_weight
+            self.lora_A.weight.data.zero_()
+            self.lora_B.weight.data.zero_()
+
+def apply_lora_to_dinov2(model, r=16, alpha=32, target_modules=None):
+    """Apply LoRA to DINOv2 attention layers"""
+    if target_modules is None:
+        target_modules = ['qkv', 'proj']
+    
+    lora_modules = {}
+    
+    def apply_lora_recursive(module, name=""):
+        for child_name, child_module in module.named_children():
+            full_name = f"{name}.{child_name}" if name else child_name
+            
+            if isinstance(child_module, nn.Linear) and any(target in full_name for target in target_modules):
+                lora_layer = LoRALinear(child_module, r=r, alpha=alpha)
+                setattr(module, child_name, lora_layer)
+                lora_modules[full_name] = lora_layer
+                print(f"Applied LoRA to: {full_name}")
+            else:
+                apply_lora_recursive(child_module, full_name)
+    
+    apply_lora_recursive(model)
+    return lora_modules
+
+class DINOv2MultiLabelClassifier(nn.Module):
+    def __init__(self, num_classes, r=16, alpha=32):
+        super().__init__()
+        # Load DINOv2 backbone
+        self.backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+        
+        # Apply LoRA
+        self.lora_modules = apply_lora_to_dinov2(self.backbone, r=r, alpha=alpha)
+        
+        # Multi-label classification head
+        self.classifier = nn.Linear(384, num_classes)  # 384 for ViT-S
+        
+        # For attention visualization
+        self.attention_weights = None
+        self.cls_features = None
+        self._register_hooks()
+        
+        # Track LoRA parameters for optimizer
+        self.lora_parameters = []
+        for module in self.lora_modules.values():
+            self.lora_parameters.extend([module.lora_A.weight, module.lora_B.weight])
+    
+    def _register_hooks(self):
+        """Register hooks to capture attention weights and CLS features"""
+        def attention_hook(module, input, output):
+            # Capture attention weights from the last layer
+            if hasattr(module, 'num_heads'):
+                # This is an attention module
+                self.attention_weights = output[1] if isinstance(output, tuple) else None
+        
+        def cls_hook(module, input, output):
+            # Capture CLS token features
+            self.cls_features = output.clone()
+        
+        # Register hook on the last attention layer for attention weights
+        for name, module in self.backbone.named_modules():
+            if 'blocks.11.attn' in name:  # Last attention layer
+                module.register_forward_hook(attention_hook)
+                break
+        
+        # Register hook on backbone output for CLS features
+        self.backbone.register_forward_hook(cls_hook)
+    
+    def forward(self, x, return_attention=False):
+        # Reset attention weights
+        self.attention_weights = None
+        
+        features = self.backbone(x)  # [batch, 384]
+        logits = self.classifier(features)  # [batch, num_classes]
+        
+        if return_attention:
+            return logits, self.attention_weights, self.cls_features
+        return logits
+    
+    def get_lora_parameters(self):
+        """Get only LoRA parameters for optimizer"""
+        return self.lora_parameters + list(self.classifier.parameters())
+    
+    def merge_and_save(self, path):
+        """Merge LoRA weights and save for production inference"""
+        for module in self.lora_modules.values():
+            module.merge_weights()
+        
+        torch.save({
+            'backbone_state_dict': self.backbone.state_dict(),
+            'classifier_state_dict': self.classifier.state_dict(),
+            'num_classes': self.classifier.out_features
+        }, path)
+        print(f"Merged model saved to {path}")
+
+class ProductionDINOv2MultiLabelClassifier(nn.Module):
+    """Production model with merged weights - no LoRA overhead"""
+    def __init__(self, num_classes):
+        super().__init__()
+        self.backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+        self.classifier = nn.Linear(384, num_classes)
+        
+        # For attention visualization
+        self.attention_weights = None
+        self.patch_embeddings = None
+        self._register_attention_hooks()
+    
+    def _register_attention_hooks(self):
+        """Register hooks to capture attention for visualization"""
+        def attention_hook(module, input, output):
+            # Capture attention weights from last layer
+            # DINOv2 attention output format: [batch, num_heads, seq_len, seq_len]
+            if len(output) > 1 and output[1] is not None:
+                self.attention_weights = output[1].detach()
+        
+        def patch_hook(module, input, output):
+            # Capture patch embeddings before attention
+            self.patch_embeddings = output.detach()
+        
+        # Hook into the last attention layer
+        last_block = None
+        for name, module in self.backbone.named_modules():
+            if name.startswith('blocks.11'):  # Last transformer block
+                last_block = module
+                break
+        
+        if last_block is not None:
+            # Try to hook attention module
+            if hasattr(last_block, 'attn'):
+                last_block.attn.register_forward_hook(attention_hook)
+    
+    def forward(self, x, return_attention=False):
+        self.attention_weights = None
+        
+        with torch.no_grad():
+            features = self.backbone(x)
+        logits = self.classifier(features)
+        
+        if return_attention:
+            return logits, self.attention_weights
+        return logits
+    
+    @classmethod
+    def from_lora_checkpoint(cls, checkpoint_path):
+        """Load from merged LoRA checkpoint"""
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        model = cls(checkpoint['num_classes'])
+        model.backbone.load_state_dict(checkpoint['backbone_state_dict'])
+        model.classifier.load_state_dict(checkpoint['classifier_state_dict'])
+        
+        return model
+
+class AttentionVisualizer:
+    def __init__(self, patch_size=14):
+        self.patch_size = patch_size
+    
+    def visualize_attention(self, image, attention_weights, predictions, class_names, 
+                          threshold=0.5, save_path=None):
+        """
+        Visualize attention maps for multi-label predictions
+        
+        Args:
+            image: Original input image tensor [C, H, W]
+            attention_weights: Attention weights [num_heads, seq_len, seq_len]
+            predictions: Sigmoid predictions [num_classes]
+            class_names: List of class names
+            threshold: Threshold for positive predictions
+        """
+        if attention_weights is None:
+            print("No attention weights captured")
+            return
+        
+        # Convert image to numpy
+        if torch.is_tensor(image):
+            # Denormalize
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            image = image * std + mean
+            image = torch.clamp(image, 0, 1)
+            image_np = image.permute(1, 2, 0).cpu().numpy()
+        else:
+            image_np = image
+        
+        # Get positive predictions
+        positive_preds = torch.where(predictions > threshold)[0]
+        
+        if len(positive_preds) == 0:
+            print("No positive predictions above threshold")
+            return
+        
+        # Average attention across heads and get CLS attention to patches
+        if len(attention_weights.shape) == 4:
+            attention_weights = attention_weights[0]  # Remove batch dimension
+        
+        # attention_weights: [num_heads, seq_len, seq_len]
+        # We want CLS token (index 0) attention to patches (index 1:)
+        cls_attention = attention_weights[:, 0, 1:].mean(dim=0)  # [num_patches]
+        
+        # Reshape to spatial dimensions
+        num_patches_side = int(cls_attention.shape[0] ** 0.5)
+        attention_map = cls_attention.reshape(num_patches_side, num_patches_side).cpu().numpy()
+        
+        # Resize attention map to image size
+        h, w = image_np.shape[:2]
+        attention_resized = cv2.resize(attention_map, (w, h))
+        attention_resized = (attention_resized - attention_resized.min()) / (attention_resized.max() - attention_resized.min())
+        
+        # Create visualization
+        num_pos_preds = len(positive_preds)
+        fig, axes = plt.subplots(2, max(3, num_pos_preds), figsize=(4*max(3, num_pos_preds), 8))
+        
+        if num_pos_preds == 1:
+            axes = axes.reshape(2, -1)
+        
+        # Original image
+        axes[0, 0].imshow(image_np)
+        axes[0, 0].set_title('Original Image')
+        axes[0, 0].axis('off')
+        
+        # Attention map
+        axes[0, 1].imshow(attention_resized, cmap='hot')
+        axes[0, 1].set_title('Attention Map')
+        axes[0, 1].axis('off')
+        
+        # Overlay
+        axes[0, 2].imshow(image_np)
+        axes[0, 2].imshow(attention_resized, alpha=0.6, cmap='hot')
+        axes[0, 2].set_title('Attention Overlay')
+        axes[0, 2].axis('off')
+        
+        # Individual class attention (if we have class-specific attention)
+        for i, pred_idx in enumerate(positive_preds[:axes.shape[1]]):
+            if i < axes.shape[1]:
+                axes[1, i].imshow(image_np)
+                axes[1, i].imshow(attention_resized, alpha=0.6, cmap='hot')
+                class_name = class_names[pred_idx]
+                confidence = predictions[pred_idx].item()
+                axes[1, i].set_title(f'{class_name}\nConf: {confidence:.3f}')
+                axes[1, i].axis('off')
+        
+        # Hide unused subplots
+        for i in range(len(positive_preds), axes.shape[1]):
+            if i < axes.shape[1]:
+                axes[1, i].axis('off')
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        
+        plt.show()
+        
+        return attention_resized
+    
+    def create_attention_heatmap(self, attention_weights, image_size=(224, 224)):
+        """Create attention heatmap from weights"""
+        if attention_weights is None:
+            return None
+        
+        # Process attention weights
+        if len(attention_weights.shape) == 4:
+            attention_weights = attention_weights[0]  # Remove batch dimension
+        
+        # Average across heads and get CLS attention
+        cls_attention = attention_weights[:, 0, 1:].mean(dim=0)
+        
+        # Reshape and resize
+        num_patches_side = int(cls_attention.shape[0] ** 0.5)
+        attention_map = cls_attention.reshape(num_patches_side, num_patches_side).cpu().numpy()
+        
+        # Resize to image size
+        attention_resized = cv2.resize(attention_map, image_size)
+        
+        # Normalize
+        attention_resized = (attention_resized - attention_resized.min()) / (attention_resized.max() - attention_resized.min())
+        
+        return attention_resized
+
+
+
+
+
+
+
+
+-------------------- dataset
+
+
+import json
+import os
+from PIL import Image
+import torch
+from torch.utils.data import Dataset
+import torchvision.transforms as transforms
+from collections import defaultdict
+import numpy as np
+
+class COCOMultiLabelDataset(Dataset):
+    def __init__(self, annotation_file, image_dir, transform=None, min_bbox_area=100):
+        """
+        COCO dataset for multi-label classification from bboxes
+        
+        Args:
+            annotation_file: Path to COCO JSON file
+            image_dir: Directory containing images
+            transform: Image transforms
+            min_bbox_area: Minimum bbox area to include
+        """
+        with open(annotation_file, 'r') as f:
+            self.coco_data = json.load(f)
+        
+        self.image_dir = image_dir
+        self.transform = transform
+        self.min_bbox_area = min_bbox_area
+        
+        # Build mappings
+        self.images = {img['id']: img for img in self.coco_data['images']}
+        self.categories = {cat['id']: cat for cat in self.coco_data['categories']}
+        
+        # Create category_id to index mapping
+        self.category_ids = sorted(list(self.categories.keys()))
+        self.cat_id_to_idx = {cat_id: idx for idx, cat_id in enumerate(self.category_ids)}
+        self.idx_to_cat_id = {idx: cat_id for cat_id, idx in self.cat_id_to_idx.items()}
+        
+        # Group annotations by image for multi-label
+        self.image_annotations = self._group_annotations_by_image()
+        
+        # Create list of valid image IDs
+        self.image_ids = list(self.image_annotations.keys())
+        
+        print(f"Loaded {len(self.image_ids)} images with {len(self.category_ids)} categories")
+        self._print_dataset_stats()
+    
+    def _group_annotations_by_image(self):
+        """Group annotations by image_id and filter valid ones"""
+        image_annotations = defaultdict(list)
+        
+        for ann in self.coco_data['annotations']:
+            # Check if image exists
+            if ann['image_id'] not in self.images:
+                continue
+            
+            # Check bbox area
+            bbox = ann['bbox']
+            area = bbox[2] * bbox[3]
+            if area < self.min_bbox_area:
+                continue
+            
+            # Check if category exists
+            if ann['category_id'] not in self.categories:
+                continue
+            
+            image_annotations[ann['image_id']].append(ann)
+        
+        return dict(image_annotations)
+    
+    def _print_dataset_stats(self):
+        """Print dataset statistics"""
+        category_counts = defaultdict(int)
+        total_annotations = 0
+        
+        for image_id, annotations in self.image_annotations.items():
+            unique_categories = set()
+            for ann in annotations:
+                unique_categories.add(ann['category_id'])
+            
+            for cat_id in unique_categories:
+                category_counts[cat_id] += 1
+            
+            total_annotations += len(annotations)
+        
+        print(f"\nDataset Statistics:")
+        print(f"Total images: {len(self.image_ids)}")
+        print(f"Total annotations: {total_annotations}")
+        print(f"Average annotations per image: {total_annotations/len(self.image_ids):.2f}")
+        
+        print("\nCategory distribution (images containing each category):")
+        for cat_id in self.category_ids:
+            cat_name = self.categories[cat_id]['name']
+            count = category_counts[cat_id]
+            print(f"  {cat_name}: {count} images")
+        
+        # Multi-label statistics
+        labels_per_image = []
+        for annotations in self.image_annotations.values():
+            unique_categories = len(set(ann['category_id'] for ann in annotations))
+            labels_per_image.append(unique_categories)
+        
+        print(f"\nMulti-label statistics:")
+        print(f"Average labels per image: {np.mean(labels_per_image):.2f}")
+        print(f"Max labels per image: {max(labels_per_image)}")
+        print(f"Min labels per image: {min(labels_per_image)}")
+    
+    def __len__(self):
+        return len(self.image_ids)
+    
+    def __getitem__(self, idx):
+        image_id = self.image_ids[idx]
+        annotations = self.image_annotations[image_id]
+        
+        # Load image
+        image_info = self.images[image_id]
+        image_path = os.path.join(self.image_dir, image_info['file_name'])
+        image = Image.open(image_path).convert('RGB')
+        
+        # For multi-label, we'll use the full image instead of cropping
+        # You can modify this to use the largest bbox or combine multiple bboxes
+        
+        # Create multi-label target
+        target = torch.zeros(len(self.category_ids), dtype=torch.float32)
+        category_ids_in_image = set()
+        
+        for ann in annotations:
+            cat_idx = self.cat_id_to_idx[ann['category_id']]
+            target[cat_idx] = 1.0
+            category_ids_in_image.add(ann['category_id'])
+        
+        # Apply transforms
+        original_image = image.copy()  # Keep for visualization
+        if self.transform:
+            image = self.transform(image)
+        
+        return {
+            'image': image,
+            'target': target,
+            'image_id': image_id,
+            'category_ids': list(category_ids_in_image),
+            'original_image': original_image,
+            'file_name': image_info['file_name']
+        }
+    
+    def get_class_names(self):
+        """Get class names in model index order"""
+        return [self.categories[cat_id]['name'] for cat_id in self.category_ids]
+    
+    def get_class_weights(self):
+        """Calculate class weights for imbalanced dataset"""
+        category_counts = defaultdict(int)
+        total_images = len(self.image_ids)
+        
+        for annotations in self.image_annotations.values():
+            unique_categories = set(ann['category_id'] for ann in annotations)
+            for cat_id in unique_categories:
+                category_counts[cat_id] += 1
+        
+        weights = []
+        for cat_id in self.category_ids:
+            count = category_counts[cat_id]
+            weight = total_images / (len(self.category_ids) * count) if count > 0 else 1.0
+            weights.append(weight)
+        
+        return torch.FloatTensor(weights)
+
+def create_transforms(image_size=224, is_training=True):
+    """Create transforms for DINOv2"""
+    if is_training:
+        transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+            transforms.RandomRotation(10),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    else:
+        transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    
+    return transform
+
+def collate_fn(batch):
+    """Custom collate function for multi-label data"""
+    images = torch.stack([item['image'] for item in batch])
+    targets = torch.stack([item['target'] for item in batch])
+    
+    # Keep other information as lists
+    image_ids = [item['image_id'] for item in batch]
+    category_ids = [item['category_ids'] for item in batch]
+    original_images = [item['original_image'] for item in batch]
+    file_names = [item['file_name'] for item in batch]
+    
+    return {
+        'images': images,
+        'targets': targets,
+        'image_ids': image_ids,
+        'category_ids': category_ids,
+        'original_images': original_images,
+        'file_names': file_names
+    }
+
+
+
+
+
+
+------------------ criterion
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MultiLabelCriterion(nn.Module):
+    def __init__(self, criterion_type='bce', class_weights=None, pos_weight=None, 
+                 focal_alpha=0.25, focal_gamma=2.0, label_smoothing=0.0):
+        """
+        Multi-label loss criterion
+        
+        Args:
+            criterion_type: 'bce', 'focal', 'weighted_bce'
+            class_weights: Class weights for imbalanced dataset
+            pos_weight: Positive class weights for BCE
+            focal_alpha: Alpha parameter for focal loss
+            focal_gamma: Gamma parameter for focal loss
+            label_smoothing: Label smoothing factor
+        """
+        super().__init__()
+        self.criterion_type = criterion_type
+        self.label_smoothing = label_smoothing
+        
+        if criterion_type == 'bce':
+            self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        elif criterion_type == 'weighted_bce':
+            self.criterion = nn.BCEWithLogitsLoss(weight=class_weights, pos_weight=pos_weight)
+        elif criterion_type == 'focal':
+            self.focal_alpha = focal_alpha
+            self.focal_gamma = focal_gamma
+        else:
+            raise ValueError(f"Unknown criterion type: {criterion_type}")
+    
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: [batch_size, num_classes] - raw logits
+            targets: [batch_size, num_classes] - binary targets
+        """
+        # Apply label smoothing if specified
+        if self.label_smoothing > 0:
+            targets = self._apply_label_smoothing(targets)
+        
+        if self.criterion_type == 'focal':
+            return self._focal_loss(logits, targets)
+        else:
+            return self.criterion(logits, targets)
+    
+    def _apply_label_smoothing(self, targets):
+        """Apply label smoothing to targets"""
+        # For multi-label: smooth 1s towards (1-eps) and 0s towards eps
+        eps = self.label_smoothing
+        smoothed_targets = targets * (1 - eps) + eps * 0.5
+        return smoothed_targets
+    
+    def _focal_loss(self, logits, targets):
+        """Focal loss for multi-label classification"""
+        # Convert logits to probabilities
+        probs = torch.sigmoid(logits)
+        
+        # Calculate focal loss
+        ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        
+        # Calculate pt
+        pt = probs * targets + (1 - probs) * (1 - targets)
+        
+        # Calculate alpha_t
+        alpha_t = self.focal_alpha * targets + (1 - self.focal_alpha) * (1 - targets)
+        
+        # Calculate focal weight
+        focal_weight = alpha_t * (1 - pt) ** self.focal_gamma
+        
+        # Apply focal weight
+        focal_loss = focal_weight * ce_loss
+        
+        return focal_loss.mean()
+
+class AsymmetricLoss(nn.Module):
+    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-8):
+        """
+        Asymmetric Loss for multi-label classification
+        Focuses more on hard negatives
+        """
+        super().__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
+        self.eps = eps
+
+    def forward(self, logits, targets):
+        # Sigmoid
+        xs_pos = torch.sigmoid(logits)
+        xs_neg = 1 - xs_pos
+
+        # Asymmetric Clipping
+        if self.clip is not None and self.clip > 0:
+            xs_neg = (xs_neg + self.clip).clamp(max=1)
+
+        # Basic CE calculation
+        los_pos = targets * torch.log(xs_pos.clamp(min=self.eps))
+        los_neg = (1 - targets) * torch.log(xs_neg.clamp(min=self.eps))
+
+        # Asymmetric Focusing
+        if self.gamma_neg > 0 or self.gamma_pos > 0:
+            pt0 = xs_pos * targets
+            pt1 = xs_neg * (1 - targets)
+            pt = pt0 + pt1
+            one_sided_gamma = self.gamma_pos * targets + self.gamma_neg * (1 - targets)
+            one_sided_w = torch.pow(1 - pt, one_sided_gamma)
+            loss = one_sided_w * (los_pos + los_neg)
+        else:
+            loss = los_pos + los_neg
+
+        return -loss.mean()
+
+def get_criterion(criterion_config, class_weights=None):
+    """Factory function to create criterion based on config"""
+    criterion_type = criterion_config.get('type', 'bce')
+    
+    if criterion_type == 'bce':
+        return MultiLabelCriterion('bce', pos_weight=class_weights)
+    elif criterion_type == 'focal':
+        return MultiLabelCriterion(
+            'focal', 
+            focal_alpha=criterion_config.get('alpha', 0.25),
+            focal_gamma=criterion_config.get('gamma', 2.0)
+        )
+    elif criterion_type == 'asymmetric':
+        return AsymmetricLoss(
+            gamma_neg=criterion_config.get('gamma_neg', 4),
+            gamma_pos=criterion_config.get('gamma_pos', 1),
+            clip=criterion_config.get('clip', 0.05)
+        )
+    else:
+        raise ValueError(f"Unknown criterion type: {criterion_type}")
+
+
+-------------------trainer
+
+import torch
+import torch.nn as nn
+import time
+import os
+from collections import defaultdict
+import matplotlib.pyplot as plt
+import json
+
+class MultiLabelTrainer:
+    def __init__(self, model, criterion, optimizer, scheduler, device, 
+                 class_names, save_dir='./checkpoints'):
+        self.model = model
+        self.criterion = criterion
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.device = device
+        self.class_names = class_names
+        self.save_dir = save_dir
+        
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Training tracking
+        self.train_losses = []
+        self.val_losses = []
+        self.val_map_scores = []
+        self.learning_rates = []
+        self.epoch_times = []
+        
+        self.best_val_score = 0
+        self.best_model_state = None
+        
+        # Attention visualizer
+        from model import AttentionVisualizer
+        self.attention_visualizer = AttentionVisualizer()
+    
+    def train_epoch(self, train_loader, epoch, visualize_attention_every=200):
+        """Train for one epoch"""
+        self.model.train()
+        running_loss = 0.0
+        num_samples = 0
+        
+        for batch_idx, batch in enumerate(train_loader):
+            images = batch['images'].to(self.device)
+            targets = batch['targets'].to(self.device)
+            
+            self.optimizer.zero_grad()
+            
+            # Forward pass
+            if batch_idx % visualize_attention_every == 0 and batch_idx > 0:
+                # Get attention for visualization
+                logits, attention_weights, cls_features = self.model(images, return_attention=True)
+                
+                # Visualize attention for first image in batch
+                if attention_weights is not None:
+                    with torch.no_grad():
+                        probs = torch.sigmoid(logits[0])
+                        original_img = batch['original_images'][0]
+                        
+                        save_path = os.path.join(self.save_dir, f'attention_epoch_{epoch}_batch_{batch_idx}.png')
+                        self.attention_visualizer.visualize_attention(
+                            images[0], attention_weights[0] if len(attention_weights.shape) > 3 else attention_weights,
+                            probs, self.class_names, save_path=save_path
+                        )
+            else:
+                logits = self.model(images)
+            
+            loss = self.criterion(logits, targets)
+            loss.backward()
+            self.optimizer.step()
+            
+            running_loss += loss.item() * images.size(0)
+            num_samples += images.size(0)
+            
+            if batch_idx % 50 == 0:
+                current_lr = self.optimizer.param_groups[0]['lr']
+                print(f'Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}, LR: {current_lr:.6f}')
+        
+        avg_loss = running_loss / num_samples
+        return avg_loss
+    
+    def validate(self, val_loader):
+        """Validate model"""
+        self.model.eval()
+        running_loss = 0.0
+        num_samples = 0
+        
+        all_predictions = []
+        all_targets = []
+       
+       with torch.no_grad():
+           for batch in val_loader:
+               images = batch['images'].to(self.device)
+               targets = batch['targets'].to(self.device)
+               
+               logits = self.model(images)
+               loss = self.criterion(logits, targets)
+               
+               running_loss += loss.item() * images.size(0)
+               num_samples += images.size(0)
+               
+               # Store predictions and targets for metrics
+               probs = torch.sigmoid(logits)
+               all_predictions.append(probs.cpu())
+               all_targets.append(targets.cpu())
+       
+       avg_loss = running_loss / num_samples
+       
+       # Calculate metrics
+       all_predictions = torch.cat(all_predictions)
+       all_targets = torch.cat(all_targets)
+       
+       from utils import calculate_multilabel_metrics
+       metrics = calculate_multilabel_metrics(all_predictions, all_targets, self.class_names)
+       
+       return avg_loss, metrics
+   
+   def train(self, train_loader, val_loader, epochs, visualize_attention_every=200):
+       """Full training loop"""
+       print(f"Starting training for {epochs} epochs...")
+       
+       for epoch in range(epochs):
+           start_time = time.time()
+           
+           # Train
+           train_loss = self.train_epoch(train_loader, epoch, visualize_attention_every)
+           
+           # Validate
+           val_loss, val_metrics = self.validate(val_loader)
+           
+           # Update scheduler
+           if self.scheduler:
+               self.scheduler.step()
+           
+           epoch_time = time.time() - start_time
+           
+           # Track metrics
+           current_lr = self.optimizer.param_groups[0]['lr']
+           val_map = val_metrics['mAP']
+           
+           self.train_losses.append(train_loss)
+           self.val_losses.append(val_loss)
+           self.val_map_scores.append(val_map)
+           self.learning_rates.append(current_lr)
+           self.epoch_times.append(epoch_time)
+           
+           # Print progress
+           print(f'Epoch {epoch}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, '
+                 f'Val mAP: {val_map:.4f}, Time: {epoch_time:.1f}s')
+           
+           # Save best model
+           if val_map > self.best_val_score:
+               self.best_val_score = val_map
+               self.best_model_state = self.model.state_dict().copy()
+               print(f'New best validation mAP: {self.best_val_score:.4f}')
+               
+               # Save checkpoint
+               self._save_checkpoint(epoch, val_metrics)
+           
+           # Plot training curves every 10 epochs
+           if (epoch + 1) % 10 == 0:
+               self.plot_training_curves()
+       
+       # Load best model
+       if self.best_model_state:
+           self.model.load_state_dict(self.best_model_state)
+           print(f'Loaded best model with validation mAP: {self.best_val_score:.4f}')
+       
+       # Final plots and save
+       self.plot_training_curves()
+       self.save_training_history()
+       
+       return self.model
+   
+   def _save_checkpoint(self, epoch, metrics):
+       """Save model checkpoint"""
+       checkpoint = {
+           'epoch': epoch,
+           'model_state_dict': self.best_model_state,
+           'optimizer_state_dict': self.optimizer.state_dict(),
+           'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+           'val_metrics': metrics,
+           'train_losses': self.train_losses,
+           'val_losses': self.val_losses,
+           'val_map_scores': self.val_map_scores
+       }
+       
+       checkpoint_path = os.path.join(self.save_dir, f'best_model_epoch_{epoch}.pth')
+       torch.save(checkpoint, checkpoint_path)
+       print(f'Checkpoint saved: {checkpoint_path}')
+   
+   def plot_training_curves(self):
+       """Plot training curves"""
+       epochs = range(1, len(self.train_losses) + 1)
+       
+       fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+       
+       # Loss curves
+       axes[0, 0].plot(epochs, self.train_losses, 'b-', label='Train Loss', linewidth=2)
+       axes[0, 0].plot(epochs, self.val_losses, 'r-', label='Val Loss', linewidth=2)
+       axes[0, 0].set_title('Training and Validation Loss')
+       axes[0, 0].set_xlabel('Epoch')
+       axes[0, 0].set_ylabel('Loss')
+       axes[0, 0].legend()
+       axes[0, 0].grid(True, alpha=0.3)
+       
+       # mAP curve
+       axes[0, 1].plot(epochs, self.val_map_scores, 'g-', linewidth=2)
+       axes[0, 1].set_title('Validation mAP')
+       axes[0, 1].set_xlabel('Epoch')
+       axes[0, 1].set_ylabel('mAP')
+       axes[0, 1].grid(True, alpha=0.3)
+       
+       # Learning rate
+       axes[1, 0].plot(epochs, self.learning_rates, 'orange', linewidth=2)
+       axes[1, 0].set_title('Learning Rate Schedule')
+       axes[1, 0].set_xlabel('Epoch')
+       axes[1, 0].set_ylabel('Learning Rate')
+       axes[1, 0].set_yscale('log')
+       axes[1, 0].grid(True, alpha=0.3)
+       
+       # Training time
+       axes[1, 1].plot(epochs, self.epoch_times, 'm-', linewidth=2)
+       axes[1, 1].set_title('Training Time per Epoch')
+       axes[1, 1].set_xlabel('Epoch')
+       axes[1, 1].set_ylabel('Time (seconds)')
+       axes[1, 1].grid(True, alpha=0.3)
+       
+       plt.tight_layout()
+       plt.savefig(os.path.join(self.save_dir, 'training_curves.png'), 
+                   dpi=150, bbox_inches='tight')
+       plt.show()
+   
+   def save_training_history(self):
+       """Save training history to JSON"""
+       history = {
+           'train_losses': self.train_losses,
+           'val_losses': self.val_losses,
+           'val_map_scores': self.val_map_scores,
+           'learning_rates': self.learning_rates,
+           'epoch_times': self.epoch_times,
+           'best_val_map': self.best_val_score
+       }
+       
+       with open(os.path.join(self.save_dir, 'training_history.json'), 'w') as f:
+           json.dump(history, f, indent=2)
+
+----------------------- utils
+
+import torch
+import numpy as np
+from sklearn.metrics import average_precision_score, roc_auc_score, f1_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def calculate_multilabel_metrics(predictions, targets, class_names, threshold=0.5):
+    """
+    Calculate comprehensive multi-label classification metrics
+    
+    Args:
+        predictions: [N, C] tensor of probabilities
+        targets: [N, C] tensor of binary targets
+        class_names: List of class names
+        threshold: Threshold for binary predictions
+    """
+    predictions = predictions.numpy() if torch.is_tensor(predictions) else predictions
+    targets = targets.numpy() if torch.is_tensor(targets) else targets
+    
+    # Binary predictions
+    binary_preds = (predictions > threshold).astype(int)
+    
+    # Calculate per-class metrics
+    per_class_ap = []
+    per_class_auc = []
+    per_class_f1 = []
+    
+    for i in range(len(class_names)):
+        # Average Precision (AP)
+        if targets[:, i].sum() > 0:  # Only if positive samples exist
+            ap = average_precision_score(targets[:, i], predictions[:, i])
+            per_class_ap.append(ap)
+        else:
+            per_class_ap.append(0.0)
+        
+        # AUC-ROC
+        if len(np.unique(targets[:, i])) > 1:  # Only if both classes exist
+            auc = roc_auc_score(targets[:, i], predictions[:, i])
+            per_class_auc.append(auc)
+        else:
+            per_class_auc.append(0.5)
+        
+        # F1 Score
+        f1 = f1_score(targets[:, i], binary_preds[:, i], zero_division=0)
+        per_class_f1.append(f1)
+    
+    # Overall metrics
+    mAP = np.mean(per_class_ap)
+    mAUC = np.mean(per_class_auc)
+    mF1 = np.mean(per_class_f1)
+    
+    # Exact match ratio (all labels correct)
+    exact_match = np.mean(np.all(binary_preds == targets, axis=1))
+    
+    # Hamming loss (fraction of incorrect labels)
+    hamming_loss = np.mean(binary_preds != targets)
+    
+    # Subset accuracy (exact match)
+    subset_accuracy = exact_match
+    
+    metrics = {
+        'mAP': mAP,
+        'mAUC': mAUC,
+        'mF1': mF1,
+        'exact_match': exact_match,
+        'hamming_loss': hamming_loss,
+        'subset_accuracy': subset_accuracy,
+        'per_class_ap': per_class_ap,
+        'per_class_auc': per_class_auc,
+        'per_class_f1': per_class_f1,
+        'class_names': class_names
+    }
+    
+    return metrics
+
+def print_detailed_metrics(metrics):
+    """Print detailed metrics in a formatted way"""
+    print("\n" + "="*60)
+    print("MULTI-LABEL CLASSIFICATION METRICS")
+    print("="*60)
+    
+    print(f"Mean Average Precision (mAP): {metrics['mAP']:.4f}")
+    print(f"Mean AUC-ROC: {metrics['mAUC']:.4f}")
+    print(f"Mean F1-Score: {metrics['mF1']:.4f}")
+    print(f"Exact Match Ratio: {metrics['exact_match']:.4f}")
+    print(f"Hamming Loss: {metrics['hamming_loss']:.4f}")
+    print(f"Subset Accuracy: {metrics['subset_accuracy']:.4f}")
+    
+    print("\nPer-Class Metrics:")
+    print("-" * 60)
+    print(f"{'Class':<20} {'AP':<8} {'AUC':<8} {'F1':<8}")
+    print("-" * 60)
+    
+    for i, class_name in enumerate(metrics['class_names']):
+        ap = metrics['per_class_ap'][i]
+        auc = metrics['per_class_auc'][i]
+        f1 = metrics['per_class_f1'][i]
+        print(f"{class_name:<20} {ap:<8.4f} {auc:<8.4f} {f1:<8.4f}")
+
+def plot_per_class_metrics(metrics, save_path=None):
+    """Plot per-class metrics"""
+    class_names = metrics['class_names']
+    ap_scores = metrics['per_class_ap']
+    auc_scores = metrics['per_class_auc']
+    f1_scores = metrics['per_class_f1']
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    x_pos = np.arange(len(class_names))
+    
+    # Average Precision
+    bars1 = axes[0].bar(x_pos, ap_scores, alpha=0.7, color='skyblue')
+    axes[0].set_title('Average Precision by Class')
+    axes[0].set_ylabel('Average Precision')
+    axes[0].set_xticks(x_pos)
+    axes[0].set_xticklabels(class_names, rotation=45, ha='right')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].set_ylim(0, 1)
+    
+    # Add value labels on bars
+    for bar, score in zip(bars1, ap_scores):
+        axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                    f'{score:.3f}', ha='center', va='bottom', fontsize=8)
+    
+    # AUC-ROC
+    bars2 = axes[1].bar(x_pos, auc_scores, alpha=0.7, color='lightgreen')
+    axes[1].set_title('AUC-ROC by Class')
+    axes[1].set_ylabel('AUC-ROC')
+    axes[1].set_xticks(x_pos)
+    axes[1].set_xticklabels(class_names, rotation=45, ha='right')
+    axes[1].grid(True, alpha=0.3)
+    axes[1].set_ylim(0, 1)
+    
+    for bar, score in zip(bars2, auc_scores):
+        axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                    f'{score:.3f}', ha='center', va='bottom', fontsize=8)
+    
+    # F1 Score
+    bars3 = axes[2].bar(x_pos, f1_scores, alpha=0.7, color='salmon')
+    axes[2].set_title('F1-Score by Class')
+    axes[2].set_ylabel('F1-Score')
+    axes[2].set_xticks(x_pos)
+    axes[2].set_xticklabels(class_names, rotation=45, ha='right')
+    axes[2].grid(True, alpha=0.3)
+    axes[2].set_ylim(0, 1)
+    
+    for bar, score in zip(bars3, f1_scores):
+        axes[2].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                    f'{score:.3f}', ha='center', va='bottom', fontsize=8)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    
+    plt.show()
+
+def plot_prediction_distribution(predictions, targets, class_names, save_path=None):
+    """Plot distribution of prediction scores"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Overall prediction distribution
+    positive_preds = predictions[targets == 1]
+    negative_preds = predictions[targets == 0]
+    
+    axes[0, 0].hist(positive_preds, bins=50, alpha=0.7, label='Positive', color='green')
+    axes[0, 0].hist(negative_preds, bins=50, alpha=0.7, label='Negative', color='red')
+    axes[0, 0].set_title('Overall Prediction Score Distribution')
+    axes[0, 0].set_xlabel('Prediction Score')
+    axes[0, 0].set_ylabel('Count')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Per-class positive prediction distribution
+    num_classes = len(class_names)
+    for i in range(min(3, num_classes)):  # Show first 3 classes
+        class_positive_preds = predictions[targets[:, i] == 1, i]
+        if len(class_positive_preds) > 0:
+            if i == 0:
+                axes[0, 1].hist(class_positive_preds, bins=30, alpha=0.7, 
+                              label=class_names[i][:10])
+            elif i == 1:
+                axes[1, 0].hist(class_positive_preds, bins=30, alpha=0.7, 
+                              label=class_names[i][:10])
+            elif i == 2:
+                axes[1, 1].hist(class_positive_preds, bins=30, alpha=0.7, 
+                              label=class_names[i][:10])
+    
+    axes[0, 1].set_title('Positive Predictions - Class 1')
+    axes[0, 1].set_xlabel('Prediction Score')
+    axes[0, 1].set_ylabel('Count')
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    axes[1, 0].set_title('Positive Predictions - Class 2')
+    axes[1, 0].set_xlabel('Prediction Score')
+    axes[1, 0].set_ylabel('Count')
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    axes[1, 1].set_title('Positive Predictions - Class 3')
+    axes[1, 1].set_xlabel('Prediction Score')
+    axes[1, 1].set_ylabel('Count')
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    
+    plt.show()
+
+def print_model_stats(model):
+    """Print model parameter statistics"""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    lora_params = sum(p.numel() for p in model.get_lora_parameters())
+    
+    print(f"Model Statistics:")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"LoRA parameters: {lora_params:,}")
+    print(f"Trainable %: {100 * trainable_params / total_params:.2f}%")
+    print(f"Memory reduction: {total_params / trainable_params:.1f}x")
+
+def visualize_multilabel_predictions(images, predictions, targets, class_names, 
+                                   threshold=0.5, num_samples=8, save_path=None):
+    """Visualize multi-label predictions"""
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    axes = axes.flatten()
+    
+    for i in range(min(num_samples, len(images))):
+        # Denormalize image
+        img = images[i].clone()
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        img = img * std + mean
+        img = torch.clamp(img, 0, 1)
+        img_np = img.permute(1, 2, 0).numpy()
+        
+        axes[i].imshow(img_np)
+        
+        # Get predictions and targets for this image
+        pred = predictions[i]
+        target = targets[i]
+        
+        # Find positive predictions and targets
+        pos_preds = torch.where(pred > threshold)[0]
+        pos_targets = torch.where(target == 1)[0]
+        
+        # Create title
+        pred_names = [class_names[idx] for idx in pos_preds]
+        target_names = [class_names[idx] for idx in pos_targets]
+        
+        title = f"True: {', '.join(target_names[:3])}\n"
+        title += f"Pred: {', '.join(pred_names[:3])}"
+        
+        axes[i].set_title(title, fontsize=9)
+        axes[i].axis('off')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    
+    plt.show()
+
+
+
+--------------------------eval
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import classification_report
+import json
+import os
+from utils import calculate_multilabel_metrics, print_detailed_metrics, plot_per_class_metrics
+
+class MultiLabelEvaluator:
+    def __init__(self, model, class_names, device, save_dir='./evaluation'):
+        self.model = model
+        self.class_names = class_names
+        self.device = device
+        self.save_dir = save_dir
+        
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Import attention visualizer
+        from model import AttentionVisualizer
+        self.attention_visualizer = AttentionVisualizer()
+    
+    def evaluate(self, test_loader, threshold=0.5, visualize_attention=True, 
+                num_attention_samples=10):
+        """Comprehensive evaluation of multi-label classifier"""
+        print("Starting comprehensive evaluation...")
+        
+        self.model.eval()
+        all_predictions = []
+        all_targets = []
+        all_image_ids = []
+        attention_samples = []
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(test_loader):
+                images = batch['images'].to(self.device)
+                targets = batch['targets'].to(self.device)
+                
+                # Get predictions and attention
+                if visualize_attention and len(attention_samples) < num_attention_samples:
+                    logits, attention_weights = self.model(images, return_attention=True)
+                    
+                    # Store attention samples
+                    for i in range(min(2, images.size(0))):
+                        if len(attention_samples) < num_attention_samples:
+                            attention_samples.append({
+                                'image': images[i],
+                                'attention': attention_weights[i] if attention_weights is not None else None,
+                                'predictions': torch.sigmoid(logits[i]),
+                                'targets': targets[i],
+                                'original_image': batch['original_images'][i],
+                                'file_name': batch['file_names'][i]
+                            })
+                else:
+                    logits = self.model(images)
+                
+                predictions = torch.sigmoid(logits)
+                
+                all_predictions.append(predictions.cpu())
+                all_targets.append(targets.cpu())
+                all_image_ids.extend(batch['image_ids'])
+        
+        # Concatenate all results
+        all_predictions = torch.cat(all_predictions)
+        all_targets = torch.cat(all_targets)
+        
+        # Calculate metrics
+        metrics = calculate_multilabel_metrics(all_predictions, all_targets, self.class_names, threshold)
+        
+        # Print results
+        print_detailed_metrics(metrics)
+        
+        # Generate visualizations
+        self._plot_metrics(metrics)
+        self._plot_threshold_analysis(all_predictions, all_targets)
+        self._plot_confusion_matrices(all_predictions, all_targets, threshold)
+        
+        if visualize_attention and attention_samples:
+            self._visualize_attention_samples(attention_samples)
+        
+        # Save results
+        self._save_results(metrics, all_predictions, all_targets, all_image_ids, threshold)
+        
+        return metrics
+    
+    def _plot_metrics(self, metrics):
+        """Plot per-class metrics"""
+        plot_per_class_metrics(metrics, save_path=os.path.join(self.save_dir, 'per_class_metrics.png'))
+    
+    def _plot_threshold_analysis(self, predictions, targets):
+        """Analyze performance across different thresholds"""
+        thresholds = np.linspace(0.1, 0.9, 9)
+        map_scores = []
+        f1_scores = []
+        
+        for thresh in thresholds:
+            metrics = calculate_multilabel_metrics(predictions, targets, self.class_names, thresh)
+            map_scores.append(metrics['mAP'])
+            f1_scores.append(metrics['mF1'])
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        
+        ax1.plot(thresholds, map_scores, 'bo-', linewidth=2, markersize=8)
+        ax1.set_title('mAP vs Threshold')
+        ax1.set_xlabel('Threshold')
+        ax1.set_ylabel('mAP')
+        ax1.grid(True, alpha=0.3)
+        
+        ax2.plot(thresholds, f1_scores, 'ro-', linewidth=2, markersize=8)
+        ax2.set_title('mF1 vs Threshold')
+        ax2.set_xlabel('Threshold')
+        ax2.set_ylabel('mF1')
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, 'threshold_analysis.png'), 
+                   dpi=150, bbox_inches='tight')
+        plt.show()
+        
+        # Find optimal threshold
+        optimal_idx = np.argmax(f1_scores)
+        optimal_threshold = thresholds[optimal_idx]
+        print(f"\nOptimal threshold for F1: {optimal_threshold:.2f} (F1: {f1_scores[optimal_idx]:.4f})")
+    
+    def _plot_confusion_matrices(self, predictions, targets, threshold):
+        """Plot confusion matrices for each class"""
+        binary_preds = (predictions > threshold).numpy()
+        targets_np = targets.numpy()
+        
+        num_classes = len(self.class_names)
+        cols = 4
+        rows = (num_classes + cols - 1) // cols
+        
+        fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 3*rows))
+        if rows == 1:
+            axes = axes.reshape(1, -1)
+        
+        for i, class_name in enumerate(self.class_names):
+            row = i // cols
+            col = i % cols
+            
+            # Create confusion matrix for this class
+            cm = np.zeros((2, 2))
+            cm[0, 0] = np.sum((targets_np[:, i] == 0) & (binary_preds[:, i] == 0))  # TN
+            cm[0, 1] = np.sum((targets_np[:, i] == 0) & (binary_preds[:, i] == 1))  # FP
+            cm[1, 0] = np.sum((targets_np[:, i] == 1) & (binary_preds[:, i] == 0))  # FN
+            cm[1, 1] = np.sum((targets_np[:, i] == 1) & (binary_preds[:, i] == 1))  # TP
+            
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                       xticklabels=['Neg', 'Pos'],
+                       yticklabels=['Neg', 'Pos'],
+                       ax=axes[row, col])
+            axes[row, col].set_title(f'{class_name}')
+            axes[row, col].set_xlabel('Predicted')
+            axes[row, col].set_ylabel('Actual')
+        
+        # Hide unused subplots
+        for i in range(num_classes, rows * cols):
+            row = i // cols
+            col = i % cols
+            axes[row, col].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, 'confusion_matrices.png'), 
+                   dpi=150, bbox_inches='tight')
+        plt.show()
+    
+    def _visualize_attention_samples(self, attention_samples):
+        """Visualize attention for sample predictions"""
+        print("Visualizing attention maps...")
+        
+        for i, sample in enumerate(attention_samples):
+            save_path = os.path.join(self.save_dir, f'attention_sample_{i}.png')
+            
+            self.attention_visualizer.visualize_attention(
+                sample['image'],
+                sample['attention'],
+                sample['predictions'],
+                self.class_names,
+                save_path=save_path
+            )
+    
+    def _save_results(self, metrics, predictions, targets, image_ids, threshold):
+        """Save detailed evaluation results"""
+        # Convert tensors to lists for JSON serialization
+        predictions_list = predictions.numpy().tolist()
+        targets_list = targets.numpy().tolist()
+        
+        # Binary predictions
+        binary_preds = (predictions > threshold).numpy().tolist()
+        
+        results = {
+            'metrics': {
+                'mAP': metrics['mAP'],
+                'mAUC': metrics['mAUC'],
+                'mF1': metrics['mF1'],
+                'exact_match': metrics['exact_match'],
+                'hamming_loss': metrics['hamming_loss'],
+                'subset_accuracy': metrics['subset_accuracy'],
+                'per_class_ap': metrics['per_class_ap'],
+                'per_class_auc': metrics['per_class_auc'],
+                'per_class_f1': metrics['per_class_f1']
+            },
+            'predictions': {
+                'image_ids': image_ids,
+                'probabilities': predictions_list,
+                'binary_predictions': binary_preds,
+                'targets': targets_list,
+                'threshold': threshold
+            },
+            'class_names': self.class_names
+        }
+        
+        # Save to JSON
+        with open(os.path.join(self.save_dir, 'evaluation_results.json'), 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        print(f"\nEvaluation results saved to {self.save_dir}")
+    
+    def analyze_top_predictions(self, test_loader, top_k=5):
+        """Analyze top-k confident predictions for each class"""
+        self.model.eval()
+        
+        class_predictions = {i: [] for i in range(len(self.class_names))}
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                images = batch['images'].to(self.device)
+                targets = batch['targets'].to(self.device)
+                
+                logits = self.model(images)
+                predictions = torch.sigmoid(logits)
+                
+                for i in range(images.size(0)):
+                    for class_idx in range(len(self.class_names)):
+                        class_predictions[class_idx].append({
+                            'confidence': predictions[i, class_idx].item(),
+                            'target': targets[i, class_idx].item(),
+                            'image_id': batch['image_ids'][i],
+                            'file_name': batch['file_names'][i]
+                        })
+        
+        # Analyze top predictions for each class
+        print("\nTop Confident Predictions Analysis:")
+        print("="*60)
+        
+        for class_idx, class_name in enumerate(self.class_names):
+            # Sort by confidence
+            sorted_preds = sorted(class_predictions[class_idx], 
+                                key=lambda x: x['confidence'], reverse=True)
+            
+            top_preds = sorted_preds[:top_k]
+           
+           # Calculate accuracy of top predictions
+           correct = sum(1 for pred in top_preds if pred['target'] == 1)
+           accuracy = correct / len(top_preds)
+           
+           print(f"\n{class_name}:")
+           print(f"  Top-{top_k} confidence accuracy: {accuracy:.3f} ({correct}/{len(top_preds)})")
+           print(f"  Confidence range: {top_preds[-1]['confidence']:.3f} - {top_preds[0]['confidence']:.3f}")
+           
+           # Show individual predictions
+           for j, pred in enumerate(top_preds):
+               status = "✓" if pred['target'] == 1 else "✗"
+               print(f"    {j+1}. {pred['file_name'][:30]:<30} "
+                     f"Conf: {pred['confidence']:.3f} {status}")
+
+
+------------------- main
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import argparse
+import os
+import json
+
+from dataset import COCOMultiLabelDataset, create_transforms, collate_fn
+from model import DINOv2MultiLabelClassifier, ProductionDINOv2MultiLabelClassifier
+from criterion import get_criterion
+from trainer import MultiLabelTrainer
+from eval import MultiLabelEvaluator
+from utils import print_model_stats
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Multi-label COCO Classification with DINOv2')
+    
+    # Data arguments
+    parser.add_argument('--train_ann', type=str, required=True,
+                       help='Path to training annotations JSON')
+    parser.add_argument('--val_ann', type=str, required=True,
+                       help='Path to validation annotations JSON')
+    parser.add_argument('--test_ann', type=str, required=True,
+                       help='Path to test annotations JSON')
+    parser.add_argument('--image_dir', type=str, required=True,
+                       help='Directory containing images')
+    
+    # Model arguments
+    parser.add_argument('--lora_r', type=int, default=16,
+                       help='LoRA rank')
+    parser.add_argument('--lora_alpha', type=int, default=32,
+                       help='LoRA alpha')
+    
+    # Training arguments
+    parser.add_argument('--batch_size', type=int, default=32,
+                       help='Batch size')
+    parser.add_argument('--epochs', type=int, default=50,
+                       help='Number of epochs')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                       help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.01,
+                       help='Weight decay')
+    
+    # Loss arguments
+    parser.add_argument('--criterion', type=str, default='bce',
+                       choices=['bce', 'focal', 'asymmetric'],
+                       help='Loss criterion')
+    parser.add_argument('--focal_alpha', type=float, default=0.25,
+                       help='Focal loss alpha')
+    parser.add_argument('--focal_gamma', type=float, default=2.0,
+                       help='Focal loss gamma')
+    
+    # Visualization arguments
+    parser.add_argument('--visualize_attention_every', type=int, default=200,
+                       help='Visualize attention every N batches')
+    parser.add_argument('--num_attention_samples', type=int, default=10,
+                       help='Number of attention samples to visualize during evaluation')
+    
+    # Output arguments
+    parser.add_argument('--save_dir', type=str, default='./outputs',
+                       help='Directory to save outputs')
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
+                       help='Directory to save checkpoints')
+    
+    # Evaluation arguments
+    parser.add_argument('--threshold', type=float, default=0.5,
+                       help='Threshold for binary predictions')
+    parser.add_argument('--eval_only', action='store_true',
+                       help='Only run evaluation')
+    parser.add_argument('--checkpoint_path', type=str,
+                       help='Path to checkpoint for evaluation')
+    
+    return parser.parse_args()
+
+def setup_data(args):
+    """Setup datasets and data loaders"""
+    print("Setting up datasets...")
+    
+    # Create datasets
+    train_dataset = COCOMultiLabelDataset(
+        args.train_ann, args.image_dir,
+        transform=create_transforms(is_training=True)
+    )
+    
+    val_dataset = COCOMultiLabelDataset(
+        args.val_ann, args.image_dir,
+        transform=create_transforms(is_training=False)
+    )
+    
+    test_dataset = COCOMultiLabelDataset(
+        args.test_ann, args.image_dir,
+        transform=create_transforms(is_training=False)
+    )
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=4,
+        collate_fn=collate_fn
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=4,
+        collate_fn=collate_fn
+    )
+    
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=4,
+        collate_fn=collate_fn
+    )
+    
+    return train_loader, val_loader, test_loader, train_dataset
+
+def setup_model(num_classes, args, device):
+    """Setup model, criterion, optimizer, and scheduler"""
+    print("Setting up model...")
+    
+    # Create model
+    model = DINOv2MultiLabelClassifier(
+        num_classes=num_classes,
+        r=args.lora_r,
+        alpha=args.lora_alpha
+    ).to(device)
+    
+    print_model_stats(model)
+    
+    # Create criterion
+    criterion_config = {
+        'type': args.criterion,
+        'alpha': args.focal_alpha,
+        'gamma': args.focal_gamma
+    }
+    criterion = get_criterion(criterion_config)
+    
+    # Create optimizer
+    optimizer = torch.optim.AdamW(
+        model.get_lora_parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
+    
+    # Create scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs
+    )
+    
+    return model, criterion, optimizer, scheduler
+
+def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader, 
+                class_names, args, device):
+    """Train the model"""
+    print("Starting training...")
+    
+    trainer = MultiLabelTrainer(
+        model=model,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        class_names=class_names,
+        save_dir=args.checkpoint_dir
+    )
+    
+    trained_model = trainer.train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        epochs=args.epochs,
+        visualize_attention_every=args.visualize_attention_every
+    )
+    
+    # Save final model
+    final_model_path = os.path.join(args.checkpoint_dir, 'final_model.pth')
+    trained_model.merge_and_save(final_model_path)
+    
+    return trained_model, final_model_path
+
+def evaluate_model(model_path, test_loader, class_names, args, device):
+    """Evaluate the model"""
+    print("Starting evaluation...")
+    
+    # Load production model
+    model = ProductionDINOv2MultiLabelClassifier.from_lora_checkpoint(model_path)
+    model = model.to(device)
+    
+    # Create evaluator
+    evaluator = MultiLabelEvaluator(
+        model=model,
+        class_names=class_names,
+        device=device,
+        save_dir=args.save_dir
+    )
+    
+    # Run evaluation
+    metrics = evaluator.evaluate(
+        test_loader=test_loader,
+        threshold=args.threshold,
+        visualize_attention=True,
+        num_attention_samples=args.num_attention_samples
+    )
+    
+    # Additional analysis
+    evaluator.analyze_top_predictions(test_loader, top_k=5)
+    
+    return metrics
+
+def main():
+    args = parse_args()
+    
+    # Create output directories
+    os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    
+    # Setup device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Setup data
+    train_loader, val_loader, test_loader, train_dataset = setup_data(args)
+    
+    # Get class information
+    class_names = train_dataset.get_class_names()
+    num_classes = len(class_names)
+    
+    print(f"Number of classes: {num_classes}")
+    print(f"Classes: {class_names}")
+    
+    if args.eval_only:
+        # Evaluation only
+        if not args.checkpoint_path:
+            raise ValueError("checkpoint_path required for evaluation")
+        
+        metrics = evaluate_model(
+            args.checkpoint_path, test_loader, class_names, args, device
+        )
+        
+    else:
+        # Training + Evaluation
+        model, criterion, optimizer, scheduler = setup_model(num_classes, args, device)
+        
+        # Train model
+        trained_model, model_path = train_model(
+            model, criterion, optimizer, scheduler,
+            train_loader, val_loader, class_names, args, device
+        )
+        
+        # Evaluate model
+        metrics = evaluate_model(model_path, test_loader, class_names, args, device)
+    
+    # Save configuration
+    config = {
+        'args': vars(args),
+        'class_names': class_names,
+        'num_classes': num_classes,
+        'final_metrics': {
+            'mAP': metrics['mAP'],
+            'mAUC': metrics['mAUC'],
+            'mF1': metrics['mF1'],
+            'exact_match': metrics['exact_match']
+        }
+    }
+    
+    with open(os.path.join(args.save_dir, 'config.json'), 'w') as f:
+        json.dump(config, f, indent=2)
+    
+    print("\n" + "="*60)
+    print("FINAL RESULTS")
+    print("="*60)
+    print(f"mAP: {metrics['mAP']:.4f}")
+    print(f"mAUC: {metrics['mAUC']:.4f}")
+    print(f"mF1: {metrics['mF1']:.4f}")
+    print(f"Exact Match: {metrics['exact_match']:.4f}")
+    print(f"Results saved to: {args.save_dir}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
