@@ -1750,6 +1750,492 @@ def main():
 if __name__ == "__main__":
     main()
 
+----------------------------------v2
+
+import torch
+import torch.nn as nn
+import math
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+import cv2
+
+class LoRALinear(nn.Module):
+    def __init__(self, original_layer, r=16, alpha=32, dropout=0.1):
+        super().__init__()
+        self.original_layer = original_layer
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / r
+        
+        # Freeze original weights
+        for param in self.original_layer.parameters():
+            param.requires_grad = False
+            
+        # LoRA matrices
+        self.lora_A = nn.Linear(original_layer.in_features, r, bias=False)
+        self.lora_B = nn.Linear(r, original_layer.out_features, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Initialize LoRA weights
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        
+    def forward(self, x):
+        original_out = self.original_layer(x)
+        lora_out = self.lora_A(x)
+        lora_out = self.dropout(lora_out)
+        lora_out = self.lora_B(lora_out)
+        return original_out + (lora_out * self.scaling)
+    
+    def merge_weights(self):
+        """Merge LoRA weights into original layer for inference"""
+        if self.r > 0:
+            lora_weight = (self.lora_B.weight @ self.lora_A.weight) * self.scaling
+            self.original_layer.weight.data += lora_weight
+            self.lora_A.weight.data.zero_()
+            self.lora_B.weight.data.zero_()
+
+def apply_lora_to_dinov2(model, r=16, alpha=32, target_modules=None):
+    """Apply LoRA to DINOv2 attention layers"""
+    if target_modules is None:
+        target_modules = ['qkv', 'proj']
+    
+    lora_modules = {}
+    
+    def apply_lora_recursive(module, name=""):
+        for child_name, child_module in module.named_children():
+            full_name = f"{name}.{child_name}" if name else child_name
+            
+            if isinstance(child_module, nn.Linear) and any(target in full_name for target in target_modules):
+                lora_layer = LoRALinear(child_module, r=r, alpha=alpha)
+                setattr(module, child_name, lora_layer)
+                lora_modules[full_name] = lora_layer
+                print(f"Applied LoRA to: {full_name}")
+            else:
+                apply_lora_recursive(child_module, full_name)
+    
+    apply_lora_recursive(model)
+    return lora_modules
+
+class AttentionExtractor:
+    """Helper class to extract attention weights from DINOv2"""
+    def __init__(self, model):
+        self.model = model
+        self.attention_weights = None
+        self.hooks = []
+        self._register_hooks()
+    
+    def _register_hooks(self):
+        """Register hooks to capture attention weights"""
+        def attention_hook(module, input, output):
+            # DINOv2 attention forward returns (output, attention_weights)
+            # We need to modify the forward to capture attention
+            if hasattr(module, 'num_heads'):
+                # This is an attention module - we'll capture attention during forward
+                pass
+        
+        # Find the last attention block
+        for name, module in self.model.named_modules():
+            if 'blocks.11.attn' in name:  # Last transformer block attention
+                self._patch_attention_module(module)
+                break
+    
+    def _patch_attention_module(self, attn_module):
+        """Patch the attention module to return attention weights"""
+        original_forward = attn_module.forward
+        
+        def new_forward(x):
+            B, N, C = x.shape
+            
+            # Get qkv from the original module
+            if hasattr(attn_module, 'qkv'):
+                qkv = attn_module.qkv(x)
+                qkv = qkv.reshape(B, N, 3, attn_module.num_heads, C // attn_module.num_heads).permute(2, 0, 3, 1, 4)
+                q, k, v = qkv.unbind(0)
+            else:
+                # Fallback if structure is different
+                return original_forward(x)
+            
+            # Compute attention weights
+            attn = (q @ k.transpose(-2, -1)) * attn_module.scale
+            attn = attn.softmax(dim=-1)
+            
+            # Store attention weights
+            self.attention_weights = attn.detach()
+            
+            # Continue with normal attention
+            attn = attn_module.attn_drop(attn)
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            x = attn_module.proj(x)
+            x = attn_module.proj_drop(x)
+            
+            return x
+        
+        # Replace the forward method
+        attn_module.forward = new_forward
+    
+    def get_attention(self):
+        """Get captured attention weights"""
+        return self.attention_weights
+    
+    def clear_attention(self):
+        """Clear stored attention weights"""
+        self.attention_weights = None
+
+class DINOv2MultiLabelClassifier(nn.Module):
+    def __init__(self, num_classes, r=16, alpha=32):
+        super().__init__()
+        # Load DINOv2 backbone
+        self.backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+        
+        # Apply LoRA
+        self.lora_modules = apply_lora_to_dinov2(self.backbone, r=r, alpha=alpha)
+        
+        # Multi-label classification head
+        self.classifier = nn.Linear(384, num_classes)  # 384 for ViT-S
+        
+        # Attention extractor
+        self.attention_extractor = AttentionExtractor(self.backbone)
+        
+        # For CLS features
+        self.cls_features = None
+        self._register_cls_hook()
+        
+        # Track LoRA parameters for optimizer
+        self.lora_parameters = []
+        for module in self.lora_modules.values():
+            self.lora_parameters.extend([module.lora_A.weight, module.lora_B.weight])
+    
+    def _register_cls_hook(self):
+        """Register hook to capture CLS features"""
+        def cls_hook(module, input, output):
+            self.cls_features = output.clone()
+        
+        self.backbone.register_forward_hook(cls_hook)
+    
+    def forward(self, x, return_attention=False):
+        # Clear previous attention
+        self.attention_extractor.clear_attention()
+        
+        features = self.backbone(x)  # [batch, 384]
+        logits = self.classifier(features)  # [batch, num_classes]
+        
+        if return_attention:
+            attention_weights = self.attention_extractor.get_attention()
+            return logits, attention_weights, self.cls_features
+        return logits
+    
+    def get_lora_parameters(self):
+        """Get only LoRA parameters for optimizer"""
+        return self.lora_parameters + list(self.classifier.parameters())
+    
+    def merge_and_save(self, path):
+        """Merge LoRA weights and save for production inference"""
+        for module in self.lora_modules.values():
+            module.merge_weights()
+        
+        torch.save({
+            'backbone_state_dict': self.backbone.state_dict(),
+            'classifier_state_dict': self.classifier.state_dict(),
+            'num_classes': self.classifier.out_features
+        }, path)
+        print(f"Merged model saved to {path}")
+
+class ProductionDINOv2MultiLabelClassifier(nn.Module):
+    """Production model with merged weights - no LoRA overhead"""
+    def __init__(self, num_classes):
+        super().__init__()
+        self.backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+        self.classifier = nn.Linear(384, num_classes)
+        
+        # Attention extractor for production
+        self.attention_extractor = AttentionExtractor(self.backbone)
+        
+        # For CLS features
+        self.cls_features = None
+        self._register_cls_hook()
+    
+    def _register_cls_hook(self):
+        """Register hook to capture CLS features"""
+        def cls_hook(module, input, output):
+            self.cls_features = output.clone()
+        
+        self.backbone.register_forward_hook(cls_hook)
+    
+    def forward(self, x, return_attention=False):
+        self.attention_extractor.clear_attention()
+        
+        with torch.no_grad():
+            features = self.backbone(x)
+        logits = self.classifier(features)
+        
+        if return_attention:
+            attention_weights = self.attention_extractor.get_attention()
+            return logits, attention_weights
+        return logits
+    
+    @classmethod
+    def from_lora_checkpoint(cls, checkpoint_path):
+        """Load from merged LoRA checkpoint"""
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        model = cls(checkpoint['num_classes'])
+        model.backbone.load_state_dict(checkpoint['backbone_state_dict'])
+        model.classifier.load_state_dict(checkpoint['classifier_state_dict'])
+        
+        return model
+
+class AttentionVisualizer:
+    def __init__(self, patch_size=14):
+        self.patch_size = patch_size
+    
+    def visualize_attention(self, image, attention_weights, predictions, class_names, 
+                          threshold=0.5, save_path=None):
+        """
+        Visualize attention maps for multi-label predictions
+        
+        Args:
+            image: Original input image tensor [C, H, W]
+            attention_weights: Attention weights [num_heads, seq_len, seq_len]
+            predictions: Sigmoid predictions [num_classes]
+            class_names: List of class names
+            threshold: Threshold for positive predictions
+        """
+        if attention_weights is None:
+            print("No attention weights captured")
+            return
+        
+        # Convert image to numpy
+        if torch.is_tensor(image):
+            # Denormalize
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            image = image * std + mean
+            image = torch.clamp(image, 0, 1)
+            image_np = image.permute(1, 2, 0).cpu().numpy()
+        else:
+            image_np = image
+        
+        # Get positive predictions
+        if torch.is_tensor(predictions):
+            predictions = predictions.cpu()
+        positive_preds = torch.where(predictions > threshold)[0]
+        
+        if len(positive_preds) == 0:
+            print("No positive predictions above threshold")
+            return
+        
+        # Process attention weights
+        if torch.is_tensor(attention_weights):
+            attention_weights = attention_weights.cpu().numpy()
+        
+        # attention_weights shape: [num_heads, seq_len, seq_len]
+        # We want CLS token (index 0) attention to patches (index 1:)
+        if len(attention_weights.shape) == 4:
+            attention_weights = attention_weights[0]  # Remove batch dimension if present
+        
+        cls_attention = attention_weights[:, 0, 1:].mean(axis=0)  # [num_patches]
+        
+        # Reshape to spatial dimensions
+        num_patches_side = int(cls_attention.shape[0] ** 0.5)
+        if num_patches_side * num_patches_side != cls_attention.shape[0]:
+            print(f"Warning: Cannot reshape {cls_attention.shape[0]} patches to square grid")
+            return
+        
+        attention_map = cls_attention.reshape(num_patches_side, num_patches_side)
+        
+        # Resize attention map to image size
+        h, w = image_np.shape[:2]
+        attention_resized = cv2.resize(attention_map, (w, h))
+        
+        # Normalize attention map
+        if attention_resized.max() > attention_resized.min():
+            attention_resized = (attention_resized - attention_resized.min()) / (attention_resized.max() - attention_resized.min())
+        
+        # Create visualization
+        num_pos_preds = len(positive_preds)
+        fig, axes = plt.subplots(2, max(3, num_pos_preds), figsize=(4*max(3, num_pos_preds), 8))
+        
+        if num_pos_preds == 1:
+            axes = axes.reshape(2, -1)
+        elif len(axes.shape) == 1:
+            axes = axes.reshape(-1, 1)
+        
+        # Original image
+        axes[0, 0].imshow(image_np)
+        axes[0, 0].set_title('Original Image')
+        axes[0, 0].axis('off')
+        
+        # Attention map
+        im1 = axes[0, 1].imshow(attention_resized, cmap='hot')
+        axes[0, 1].set_title('Attention Map')
+        axes[0, 1].axis('off')
+        plt.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04)
+        
+        # Overlay
+        axes[0, 2].imshow(image_np)
+        axes[0, 2].imshow(attention_resized, alpha=0.6, cmap='hot')
+        axes[0, 2].set_title('Attention Overlay')
+        axes[0, 2].axis('off')
+        
+        # Individual class predictions
+        for i, pred_idx in enumerate(positive_preds[:axes.shape[1]]):
+            if i < axes.shape[1]:
+                axes[1, i].imshow(image_np)
+                axes[1, i].imshow(attention_resized, alpha=0.6, cmap='hot')
+                class_name = class_names[pred_idx]
+                confidence = predictions[pred_idx].item()
+                axes[1, i].set_title(f'{class_name}\nConf: {confidence:.3f}')
+                axes[1, i].axis('off')
+        
+        # Hide unused subplots
+        for i in range(len(positive_preds), axes.shape[1]):
+            if i < axes.shape[1]:
+                axes[1, i].axis('off')
+        
+        # Hide unused subplots in top row
+        for i in range(3, axes.shape[1]):
+            axes[0, i].axis('off')
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Attention visualization saved to {save_path}")
+        
+        plt.show()
+        
+        return attention_resized
+    
+    def create_attention_heatmap(self, attention_weights, image_size=(224, 224)):
+        """Create attention heatmap from weights"""
+        if attention_weights is None:
+            return None
+        
+        # Process attention weights
+        if torch.is_tensor(attention_weights):
+            attention_weights = attention_weights.cpu().numpy()
+        
+        if len(attention_weights.shape) == 4:
+            attention_weights = attention_weights[0]  # Remove batch dimension
+        
+        # Average across heads and get CLS attention
+        cls_attention = attention_weights[:, 0, 1:].mean(axis=0)
+        
+        # Reshape and resize
+        num_patches_side = int(cls_attention.shape[0] ** 0.5)
+        attention_map = cls_attention.reshape(num_patches_side, num_patches_side)
+        
+        # Resize to image size
+        attention_resized = cv2.resize(attention_map, image_size)
+        
+        # Normalize
+        if attention_resized.max() > attention_resized.min():
+            attention_resized = (attention_resized - attention_resized.min()) / (attention_resized.max() - attention_resized.min())
+        
+        return attention_resized
+
+# Test function to verify attention extraction
+def test_attention_extraction():
+    """Test function to verify attention weights are being captured"""
+    print("Testing attention extraction...")
+    
+    # Create a simple model
+    model = DINOv2MultiLabelClassifier(num_classes=5)
+    model.eval()
+    
+    # Create dummy input
+    x = torch.randn(2, 3, 224, 224)
+    
+    # Forward pass with attention
+    with torch.no_grad():
+        logits, attention_weights, cls_features = model(x, return_attention=True)
+    
+    print(f"Logits shape: {logits.shape}")
+    print(f"CLS features shape: {cls_features.shape}")
+    
+    if attention_weights is not None:
+        print(f"Attention weights shape: {attention_weights.shape}")
+        print("✅ Attention extraction working!")
+        
+        # Test visualization
+        visualizer = AttentionVisualizer()
+        predictions = torch.sigmoid(logits[0])
+        
+        # Create dummy class names
+        class_names = [f"Class_{i}" for i in range(5)]
+        
+        # Test attention visualization
+        attention_map = visualizer.create_attention_heatmap(attention_weights[0])
+        if attention_map is not None:
+            print(f"Attention map shape: {attention_map.shape}")
+            print("✅ Attention visualization working!")
+        else:
+            print("❌ Attention visualization failed")
+    else:
+        print("❌ Attention weights are None - extraction failed")
+
+if __name__ == "__main__":
+    # Run test when script is executed directly
+    test_attention_extraction()
+
+------------------------epoch
+# Add this to the train_epoch method in trainer.py
+def train_epoch(self, train_loader, epoch, visualize_attention_every=200):
+    """Train for one epoch"""
+    self.model.train()
+    running_loss = 0.0
+    num_samples = 0
+    
+    for batch_idx, batch in enumerate(train_loader):
+        images = batch['images'].to(self.device)
+        targets = batch['targets'].to(self.device)
+        
+        self.optimizer.zero_grad()
+        
+        # Forward pass
+        if batch_idx % visualize_attention_every == 0 and batch_idx > 0:
+            # Get attention for visualization
+            try:
+                logits, attention_weights, cls_features = self.model(images, return_attention=True)
+                
+                # Check if attention was captured
+                if attention_weights is not None:
+                    print(f"✅ Captured attention weights: {attention_weights.shape}")
+                    
+                    # Visualize attention for first image in batch
+                    with torch.no_grad():
+                        probs = torch.sigmoid(logits[0])
+                        
+                        save_path = os.path.join(self.save_dir, f'attention_epoch_{epoch}_batch_{batch_idx}.png')
+                        self.attention_visualizer.visualize_attention(
+                            images[0], attention_weights[0],
+                            probs, self.class_names, save_path=save_path
+                        )
+                else:
+                    print("❌ No attention weights captured")
+                    logits = self.model(images)
+                    
+            except Exception as e:
+                print(f"❌ Error in attention visualization: {e}")
+                logits = self.model(images)
+        else:
+            logits = self.model(images)
+        
+        loss = self.criterion(logits, targets)
+        loss.backward()
+        self.optimizer.step()
+        
+        running_loss += loss.item() * images.size(0)
+        num_samples += images.size(0)
+        
+        if batch_idx % 50 == 0:
+            current_lr = self.optimizer.param_groups[0]['lr']
+            print(f'Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}, LR: {current_lr:.6f}')
+    
+    avg_loss = running_loss / num_samples
+    return avg_loss
 
 
 
