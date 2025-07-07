@@ -8,10 +8,14 @@ from collections import defaultdict
 import numpy as np
 from pycocotools import mask as coco_mask
 import cv2
+from concurrent.futures import ThreadPoolExecutor
+import pickle
+from pathlib import Path
 
 class COCOMultiLabelDataset(Dataset):
     def __init__(self, annotation_file, image_dir, transform=None, min_bbox_area=100, 
-                 noise_std=0.3, use_polygon_mask=True):
+                 noise_std=0.3, use_polygon_mask=True, cache_dir=None, precompute_masks=True,
+                 num_workers=8):
         """
         COCO dataset for multi-label classification with polygon masking
         
@@ -22,6 +26,9 @@ class COCOMultiLabelDataset(Dataset):
             min_bbox_area: Minimum bbox area to include
             noise_std: Standard deviation for Gaussian noise
             use_polygon_mask: Whether to use polygon masking
+            cache_dir: Directory to cache preprocessed data
+            precompute_masks: Whether to precompute all masks
+            num_workers: Number of workers for parallel processing
         """
         with open(annotation_file, 'r') as f:
             self.coco_data = json.load(f)
@@ -31,6 +38,15 @@ class COCOMultiLabelDataset(Dataset):
         self.min_bbox_area = min_bbox_area
         self.noise_std = noise_std
         self.use_polygon_mask = use_polygon_mask
+        self.num_workers = num_workers
+        
+        # Set up caching
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        if self.cache_dir:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self.mask_cache_path = self.cache_dir / "mask_cache.pkl"
+            self.crop_cache_dir = self.cache_dir / "crops"
+            self.crop_cache_dir.mkdir(exist_ok=True)
         
         # Build mappings
         self.images = {img['id']: img for img in self.coco_data['images']}
@@ -41,8 +57,17 @@ class COCOMultiLabelDataset(Dataset):
         self.cat_id_to_idx = {cat_id: idx for idx, cat_id in enumerate(self.category_ids)}
         self.idx_to_cat_id = {idx: cat_id for cat_id, idx in self.cat_id_to_idx.items()}
         
-        # Create annotation samples (one per annotation, not per image)
+        # Create annotation samples
         self.annotation_samples = self._create_annotation_samples()
+        
+        # Cache for masks and crops
+        self.mask_cache = {}
+        self.crop_cache = {}
+        
+        # Load or precompute masks
+        if self.use_polygon_mask:
+            if precompute_masks:
+                self._precompute_masks()
         
         print(f"Created {len(self.annotation_samples)} annotation samples from {len(self.category_ids)} categories")
         self._print_dataset_stats()
@@ -90,61 +115,142 @@ class COCOMultiLabelDataset(Dataset):
             count = category_counts[cat_id]
             print(f"  {cat_name}: {count} samples")
     
-    def _create_polygon_mask(self, image_shape, segmentation):
-        """Create polygon mask from COCO segmentation"""
-        mask = np.zeros(image_shape[:2], dtype=np.uint8)
+    def _precompute_masks(self):
+        """Precompute all masks and save to cache"""
+        print("Precomputing masks for faster training...")
         
+        # Check if cache exists
+        if self.cache_dir and self.mask_cache_path.exists():
+            print("Loading masks from cache...")
+            with open(self.mask_cache_path, 'rb') as f:
+                self.mask_cache = pickle.load(f)
+            print(f"Loaded {len(self.mask_cache)} cached masks")
+            return
+        
+        # Precompute masks in parallel
+        def process_annotation(ann):
+            try:
+                image_info = self.images[ann['image_id']]
+                image_path = os.path.join(self.image_dir, image_info['file_name'])
+                
+                # Get image shape
+                with Image.open(image_path) as img:
+                    image_shape = (img.height, img.width, 3)
+                
+                # Create mask
+                if 'segmentation' in ann:
+                    mask = self._create_polygon_mask(image_shape, ann['segmentation'])
+                    return ann['id'], mask
+                else:
+                    return ann['id'], None
+            except Exception as e:
+                print(f"Error processing annotation {ann['id']}: {e}")
+                return ann['id'], None
+        
+        # Process in parallel
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            results = list(executor.map(process_annotation, self.annotation_samples))
+        
+        # Store results
+        for ann_id, mask in results:
+            if mask is not None:
+                self.mask_cache[ann_id] = mask
+        
+        # Save cache
+        if self.cache_dir:
+            with open(self.mask_cache_path, 'wb') as f:
+                pickle.dump(self.mask_cache, f)
+            print(f"Cached {len(self.mask_cache)} masks")
+    
+    def _get_cached_crop_path(self, ann_id):
+        """Get cache path for preprocessed crop"""
+        if not self.cache_dir:
+            return None
+        return self.crop_cache_dir / f"crop_{ann_id}.jpg"
+    
+    def _create_polygon_mask_fast(self, image_shape, segmentation):
+        """Optimized polygon mask creation"""
         if isinstance(segmentation, list):
-            # Polygon format
+            # Use OpenCV for faster polygon filling
+            mask = np.zeros(image_shape[:2], dtype=np.uint8)
             for seg in segmentation:
-                if len(seg) >= 6:  # At least 3 points (x,y pairs)
-                    # Convert to polygon points
-                    points = np.array(seg).reshape(-1, 2).astype(np.int32)
+                if len(seg) >= 6:
+                    points = np.array(seg, dtype=np.int32).reshape(-1, 2)
                     cv2.fillPoly(mask, [points], 1)
+            return mask.astype(bool)
         else:
-            # RLE format
+            # RLE format - fallback to original method
             if isinstance(segmentation, dict):
                 rle = segmentation
             else:
                 rle = {'size': image_shape[:2], 'counts': segmentation}
             mask = coco_mask.decode(rle)
-        
-        return mask.astype(bool)
+            return mask.astype(bool)
     
-    def _create_masked_crop(self, image, annotation):
-        """Create masked crop with Gaussian noise background"""
-        image_np = np.array(image)
+    def _create_masked_crop_fast(self, image, annotation):
+        """Optimized masked crop creation with caching"""
+        ann_id = annotation['id']
         
-        if self.use_polygon_mask and 'segmentation' in annotation:
-            # Create polygon mask
-            mask = self._create_polygon_mask(image_np.shape, annotation['segmentation'])
-            
-            # Create Gaussian noise image with same shape
-            noise_image = np.random.normal(
-                loc=128,  # Gray background
-                scale=self.noise_std * 255,
-                size=image_np.shape
-            ).astype(np.uint8)
-            
-            # Clip values to valid range
-            noise_image = np.clip(noise_image, 0, 255)
-            
-            # Copy polygon area from original to noise image
-            masked_image = noise_image.copy()
-            masked_image[mask] = image_np[mask]
-            
-            # Convert back to PIL Image
-            masked_image_pil = Image.fromarray(masked_image)
+        # Check if crop is cached
+        cached_crop_path = self._get_cached_crop_path(ann_id)
+        if cached_crop_path and cached_crop_path.exists():
+            return Image.open(cached_crop_path).convert('RGB')
+        
+        # Get image as numpy array
+        if isinstance(image, Image.Image):
+            image_np = np.array(image)
         else:
-            # Fallback: use original image
-            masked_image_pil = image
+            image_np = image
         
-        # Crop bbox
-        bbox = annotation['bbox']  # [x, y, width, height]
-        x, y, w, h = bbox
-        cropped_image = masked_image_pil.crop((x, y, x + w, y + h))
+        if self.use_polygon_mask:
+            # Get mask from cache or compute
+            if ann_id in self.mask_cache:
+                mask = self.mask_cache[ann_id]
+            elif 'segmentation' in annotation:
+                mask = self._create_polygon_mask_fast(image_np.shape, annotation['segmentation'])
+            else:
+                mask = None
+            
+            if mask is not None:
+                # Create noise background more efficiently
+                bbox = annotation['bbox']
+                x, y, w, h = [int(v) for v in bbox]
+                
+                # Only create noise for the bbox region
+                crop_shape = (h, w, 3)
+                noise_crop = np.random.normal(
+                    loc=128,
+                    scale=self.noise_std * 255,
+                    size=crop_shape
+                ).astype(np.uint8)
+                noise_crop = np.clip(noise_crop, 0, 255)
+                
+                # Extract crops
+                image_crop = image_np[y:y+h, x:x+w]
+                mask_crop = mask[y:y+h, x:x+w]
+                
+                # Apply mask
+                masked_crop = noise_crop.copy()
+                if mask_crop.any():  # Only if mask has positive pixels
+                    masked_crop[mask_crop] = image_crop[mask_crop]
+                
+                cropped_image_pil = Image.fromarray(masked_crop)
+            else:
+                # Fallback: regular crop
+                bbox = annotation['bbox']
+                x, y, w, h = bbox
+                cropped_image_pil = image.crop((x, y, x + w, y + h))
+        else:
+            # Regular crop without masking
+            bbox = annotation['bbox']
+            x, y, w, h = bbox
+            cropped_image_pil = image.crop((x, y, x + w, y + h))
         
-        return cropped_image
+        # Cache the crop
+        if cached_crop_path:
+            cropped_image_pil.save(cached_crop_path, 'JPEG', quality=95)
+        
+        return cropped_image_pil
     
     def __len__(self):
         return len(self.annotation_samples)
@@ -155,12 +261,18 @@ class COCOMultiLabelDataset(Dataset):
         # Load image
         image_info = self.images[annotation['image_id']]
         image_path = os.path.join(self.image_dir, image_info['file_name'])
-        image = Image.open(image_path).convert('RGB')
         
-        # Create masked crop
-        cropped_image = self._create_masked_crop(image, annotation)
+        try:
+            image = Image.open(image_path).convert('RGB')
+        except Exception as e:
+            print(f"Error loading image {image_path}: {e}")
+            # Return a dummy black image
+            image = Image.new('RGB', (224, 224), color=(0, 0, 0))
         
-        # Create single-label target (not multi-label since we have one annotation per sample)
+        # Create masked crop (with caching)
+        cropped_image = self._create_masked_crop_fast(image, annotation)
+        
+        # Create single-label target
         target = torch.zeros(len(self.category_ids), dtype=torch.float32)
         cat_idx = self.cat_id_to_idx[annotation['category_id']]
         target[cat_idx] = 1.0
@@ -361,8 +473,9 @@ def analyze_class_distribution(dataset, save_path=None):
     print(f"  Least frequent class: {class_names[np.argmin(counts)]} ({min(counts)} samples)")
     print(f"  Imbalance ratio: {max(counts)/min(counts):.2f}")
 
-def create_balanced_dataloader(dataset, batch_size=32, num_workers=4, use_weighted_sampler=True):
-    """Create dataloader with optional weighted sampling for class balance"""
+def create_balanced_dataloader(dataset, batch_size=32, num_workers=8, use_weighted_sampler=True, 
+                              pin_memory=True, persistent_workers=True):
+    """Create optimized dataloader with optional weighted sampling for class balance"""
     from torch.utils.data import DataLoader
     
     if use_weighted_sampler:
@@ -381,23 +494,82 @@ def create_balanced_dataloader(dataset, batch_size=32, num_workers=4, use_weight
         sampler=sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
-        drop_last=True if sampler else False
+        drop_last=True if sampler else False,
+        pin_memory=pin_memory,  # Faster GPU transfer
+        persistent_workers=persistent_workers,  # Keep workers alive
+        prefetch_factor=4,  # Prefetch more batches
     )
     
     return dataloader
 
+# GPU-accelerated noise generation (optional)
+class GPUNoiseGenerator:
+    """GPU-accelerated noise generation for faster processing"""
+    def __init__(self, device='cuda', batch_size=32):
+        self.device = device
+        self.batch_size = batch_size
+        self.noise_cache = {}
+    
+    def generate_noise_batch(self, shapes, noise_std=0.3):
+        """Generate noise for multiple crops at once"""
+        noises = []
+        for shape in shapes:
+            h, w = shape[:2]
+            key = (h, w)
+            
+            if key not in self.noise_cache:
+                # Generate on GPU
+                noise = torch.normal(
+                    mean=128.0, 
+                    std=noise_std * 255,
+                    size=(self.batch_size, h, w, 3),
+                    device=self.device,
+                    dtype=torch.uint8
+                )
+                self.noise_cache[key] = noise
+            
+            # Get one from cache
+            noise = self.noise_cache[key][0].cpu().numpy()
+            noises.append(noise)
+        
+        return noises
+
+# Fast dataset creation function
+def create_fast_dataset(annotation_file, image_dir, cache_dir=None, 
+                       precompute_masks=True, num_workers=8, **kwargs):
+    """Create optimized dataset with caching"""
+    dataset = COCOMultiLabelDataset(
+        annotation_file=annotation_file,
+        image_dir=image_dir,
+        cache_dir=cache_dir,
+        precompute_masks=precompute_masks,
+        num_workers=num_workers,
+        **kwargs
+    )
+    
+    print(f"Dataset optimization tips:")
+    print(f"  - Use cache_dir for faster subsequent runs")
+    print(f"  - Set num_workers={min(num_workers, os.cpu_count())} in DataLoader")
+    print(f"  - Enable pin_memory=True for GPU training")
+    print(f"  - Use persistent_workers=True")
+    
+    return dataset
+
 # Example usage and testing
 def test_polygon_dataset():
-    """Test the polygon masking dataset"""
-    print("Testing polygon masking dataset...")
+    """Test the optimized polygon masking dataset"""
+    print("Testing optimized polygon masking dataset...")
     
-    # Create dataset (replace with your paths)
-    dataset = COCOMultiLabelDataset(
+    # Create dataset with caching (replace with your paths)
+    dataset = create_fast_dataset(
         annotation_file='path/to/annotations.json',
         image_dir='path/to/images/',
+        cache_dir='./cache',  # Enable caching
         transform=create_transforms(is_training=False),
         use_polygon_mask=True,
-        noise_std=0.3
+        noise_std=0.3,
+        precompute_masks=True,
+        num_workers=8
     )
     
     print(f"Dataset created with {len(dataset)} samples")
@@ -409,27 +581,30 @@ def test_polygon_dataset():
     print(f"Target shape: {sample['target'].shape}")
     print(f"Category: {dataset.categories[sample['category_id']]['name']}")
     
-    # Analyze class distribution
-    analyze_class_distribution(dataset)
+    # Test optimized dataloader
+    import time
     
-    # Visualize polygon masking
-    visualize_polygon_masking(dataset, num_samples=4)
+    print("\nTesting dataloader speed...")
+    dataloader = create_balanced_dataloader(
+        dataset, 
+        batch_size=32, 
+        num_workers=8,
+        use_weighted_sampler=True,
+        pin_memory=True,
+        persistent_workers=True
+    )
     
-    # Test weighted sampler
-    sampler = dataset.create_weighted_sampler()
-    print(f"Weighted sampler created with {len(sampler)} samples")
+    # Time a few batches
+    start_time = time.time()
+    for i, batch in enumerate(dataloader):
+        if i >= 5:  # Test 5 batches
+            break
+        print(f"Batch {i}: {batch['images'].shape}, Categories: {len(set(batch['category_ids']))}")
     
-    # Test dataloader
-    dataloader = create_balanced_dataloader(dataset, batch_size=8, use_weighted_sampler=True)
+    elapsed = time.time() - start_time
+    print(f"Processed 5 batches in {elapsed:.2f}s ({elapsed/5:.2f}s per batch)")
     
-    # Test one batch
-    for batch in dataloader:
-        print(f"Batch images shape: {batch['images'].shape}")
-        print(f"Batch targets shape: {batch['targets'].shape}")
-        print(f"Categories in batch: {batch['category_ids']}")
-        break
-    
-    print("✅ Polygon dataset test completed successfully!")
+    print("✅ Optimized polygon dataset test completed!")
 
 if __name__ == "__main__":
     test_polygon_dataset()
