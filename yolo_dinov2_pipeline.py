@@ -196,37 +196,54 @@ class YOLODINOv2Pipeline:
         
         return masked_crop
     
-    def _classify_image(self, image_array, model_info, threshold=0.4):
-        """Classify image using DINOv2 model"""
-        # Convert to PIL and apply transforms
-        if image_array.max() <= 1.0:
-            image_array = (image_array * 255).astype(np.uint8)
+    def _classify_batch(self, image_arrays, model_info, threshold=0.4):
+        """Classify batch of images using DINOv2 model"""
+        if not image_arrays:
+            return []
         
-        pil_image = Image.fromarray(image_array)
-        tensor_image = self.transform(pil_image).unsqueeze(0).to(self.device)
+        # Convert all images to tensors
+        tensor_batch = []
+        pil_images = []
         
-        # Get predictions and attention
+        for image_array in image_arrays:
+            if image_array.max() <= 1.0:
+                image_array = (image_array * 255).astype(np.uint8)
+            
+            pil_image = Image.fromarray(image_array)
+            tensor_image = self.transform(pil_image)
+            tensor_batch.append(tensor_image)
+            pil_images.append(pil_image)
+        
+        # Stack into batch
+        batch_tensor = torch.stack(tensor_batch).to(self.device)
+        
+        # Get predictions and attention for batch
         with torch.no_grad():
-            logits, attention_weights = model_info['model'](tensor_image, return_attention=True)
-            probabilities = torch.sigmoid(logits).cpu().numpy()[0]
+            logits, attention_weights = model_info['model'](batch_tensor, return_attention=True)
+            probabilities = torch.sigmoid(logits).cpu().numpy()
         
-        # Get top prediction
-        top_class_idx = np.argmax(probabilities)
-        top_class_name = model_info['class_names'][top_class_idx]
-        top_confidence = probabilities[top_class_idx]
+        # Process results for each image in batch
+        results = []
+        for i, (probs, pil_image) in enumerate(zip(probabilities, pil_images)):
+            top_class_idx = np.argmax(probs)
+            top_class_name = model_info['class_names'][top_class_idx]
+            top_confidence = probs[top_class_idx]
+            has_confident_pred = np.any(probs > threshold)
+            
+            # Get attention for this specific image
+            img_attention = attention_weights[i] if attention_weights is not None else None
+            
+            results.append({
+                'class_idx': top_class_idx,
+                'class_name': top_class_name,
+                'confidence': float(top_confidence),
+                'all_probabilities': probs,
+                'has_confident_pred': has_confident_pred,
+                'attention_weights': img_attention,
+                'original_image': pil_image
+            })
         
-        # Check if any prediction is above threshold
-        has_confident_pred = np.any(probabilities > threshold)
-        
-        return {
-            'class_idx': top_class_idx,
-            'class_name': top_class_name,
-            'confidence': float(top_confidence),
-            'all_probabilities': probabilities,
-            'has_confident_pred': has_confident_pred,
-            'attention_weights': attention_weights,
-            'original_image': pil_image
-        }
+        return results
     
     def _save_attention_visualization(self, result, model_name, output_dir, image_id, detection_id):
         """Save attention visualization for low-confidence predictions"""
@@ -275,8 +292,8 @@ class YOLODINOv2Pipeline:
         
         return annotation
     
-    def process_dataset(self, input_json, image_dir, output_dir, confidence_threshold=0.4):
-        """Process the entire dataset"""
+    def process_dataset(self, input_json, image_dir, output_dir, confidence_threshold=0.4, batch_size=16):
+        """Process the entire dataset with batch processing"""
         print("Starting dataset processing...")
         
         # Load input COCO JSON
@@ -313,6 +330,11 @@ class YOLODINOv2Pipeline:
         # Process each image
         detection_counters = {model_name: 0 for model_name in self.classifiers.keys()}
         
+        # Collect all crops for batch processing
+        all_crops = []
+        crop_metadata = []
+        
+        print("Extracting crops from YOLO detections...")
         for image_info in tqdm(input_data["images"], desc="Processing images"):
             image_id = image_info["id"]
             image_filename = image_info["file_name"]
@@ -355,31 +377,52 @@ class YOLODINOv2Pipeline:
                     # Calculate area
                     area = np.sum(self._polygon_to_mask(polygon.flatten(), image.shape))
                     
-                    # Classify with each model
-                    for model_name, model_info in self.classifiers.items():
-                        detection_counters[model_name] += 1
-                        detection_id = detection_counters[model_name]
-                        
-                        # Classify the masked crop
-                        classification_result = self._classify_image(
-                            masked_crop, model_info, confidence_threshold
-                        )
-                        
-                        # Save attention visualization if low confidence
-                        self._save_attention_visualization(
-                            classification_result, model_name, output_dir, 
-                            image_id, detection_id
-                        )
-                        
-                        # Create COCO annotation
-                        annotation = self._create_coco_annotation(
-                            detection_id, image_id, bbox, polygon.flatten(),
-                            classification_result['class_idx'], 
-                            classification_result['confidence'],
-                            area
-                        )
-                        
-                        results[model_name]["annotations"].append(annotation)
+                    # Store crop and metadata
+                    all_crops.append(masked_crop)
+                    crop_metadata.append({
+                        'image_id': image_id,
+                        'bbox': bbox,
+                        'polygon': polygon.flatten(),
+                        'area': area,
+                        'yolo_conf': yolo_conf
+                    })
+        
+        print(f"Extracted {len(all_crops)} crops, processing in batches of {batch_size}...")
+        
+        # Process crops in batches for each model
+        for model_name, model_info in self.classifiers.items():
+            print(f"Processing {model_name} classifier...")
+            
+            for start_idx in tqdm(range(0, len(all_crops), batch_size), 
+                                desc=f"Classifying with {model_name}"):
+                end_idx = min(start_idx + batch_size, len(all_crops))
+                
+                # Get batch of crops
+                batch_crops = all_crops[start_idx:end_idx]
+                batch_metadata = crop_metadata[start_idx:end_idx]
+                
+                # Classify batch
+                batch_results = self._classify_batch(batch_crops, model_info, confidence_threshold)
+                
+                # Process results
+                for crop_meta, classification_result in zip(batch_metadata, batch_results):
+                    detection_counters[model_name] += 1
+                    detection_id = detection_counters[model_name]
+                    
+                    # Save attention visualization if low confidence
+                    self._save_attention_visualization(
+                        classification_result, model_name, output_dir, 
+                        crop_meta['image_id'], detection_id
+                    )
+                    
+                    # Create COCO annotation
+                    annotation = self._create_coco_annotation(
+                        detection_id, crop_meta['image_id'], crop_meta['bbox'], 
+                        crop_meta['polygon'], classification_result['class_idx'], 
+                        classification_result['confidence'], crop_meta['area']
+                    )
+                    
+                    results[model_name]["annotations"].append(annotation)
         
         # Save results for each model
         for model_name, model_results in results.items():
@@ -396,7 +439,9 @@ class YOLODINOv2Pipeline:
             "timestamp": datetime.now().isoformat(),
             "input_json": str(input_json),
             "output_dir": str(output_dir),
+            "batch_size": batch_size,
             "total_images": len(input_data["images"]),
+            "total_crops": len(all_crops),
             "results_summary": {
                 model_name: {
                     "total_detections": len(results[model_name]["annotations"]),
@@ -437,6 +482,8 @@ def main():
     # Output arguments
     parser.add_argument('--output_dir', type=str, required=True,
                        help='Output directory for results')
+    parser.add_argument('--batch_size', type=int, default=16,
+                       help='Batch size for DINOv2 inference (default: 16)')
     parser.add_argument('--confidence_threshold', type=float, default=0.4,
                        help='Confidence threshold for saving attention maps')
     parser.add_argument('--device', type=str, default='cuda',
@@ -468,7 +515,8 @@ def main():
         input_json=args.input_json,
         image_dir=args.image_dir,
         output_dir=args.output_dir,
-        confidence_threshold=args.confidence_threshold
+        confidence_threshold=args.confidence_threshold,
+        batch_size=args.batch_size
     )
     
     print("\n" + "="*60)
