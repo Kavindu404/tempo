@@ -29,8 +29,13 @@ def create_property_map(excel_file_path: str, output_dir: str, map_filename: str
     
     # Initialize the map (centered on first address or default location)
     if not df.empty and pd.notna(df.iloc[0]['Addr_latitude']):
-        center_lat = df.iloc[0]['Addr_latitude']
-        center_lon = df.iloc[0]['Addr_longitude']
+        addr_lats = safe_eval(df.iloc[0]['Addr_latitude'])
+        addr_lons = safe_eval(df.iloc[0]['Addr_longitude'])
+        if addr_lats and addr_lons:
+            center_lat = float(addr_lats[0])
+            center_lon = float(addr_lons[0])
+        else:
+            center_lat, center_lon = 39.8283, -98.5795  # Center of US as fallback
     else:
         center_lat, center_lon = 39.8283, -98.5795  # Center of US as fallback
     
@@ -74,10 +79,14 @@ def create_property_map(excel_file_path: str, output_dir: str, map_filename: str
     
     def create_popup_content(row, index):
         """Create HTML content for popup information card"""
+        # Handle Full Address as a list
+        full_addresses = safe_eval(row.get('Full Address', []))
+        address_text = full_addresses[0] if full_addresses else 'Unknown Address'
+        
         popup_html = f"""
         <div style="width: 300px; font-family: Arial, sans-serif;">
             <h3 style="color: #333; margin-bottom: 10px; border-bottom: 2px solid #ddd; padding-bottom: 5px;">
-                {row.get('Full Address', 'Unknown Address')}
+                {address_text}
             </h3>
             <table style="width: 100%; border-collapse: collapse;">
                 <tr><td style="padding: 3px; font-weight: bold;">PreciselyID:</td>
@@ -138,14 +147,27 @@ def create_property_map(excel_file_path: str, output_dir: str, map_filename: str
     for index, row in df.iterrows():
         popup_content = create_popup_content(row, index)
         
-        # Add address marker
-        if pd.notna(row.get('Addr_latitude')) and pd.notna(row.get('Addr_longitude')):
-            folium.Marker(
-                location=[row['Addr_latitude'], row['Addr_longitude']],
-                popup=folium.Popup(popup_content, max_width=350),
-                tooltip=f"Address: {row.get('Full Address', 'Unknown')}",
-                icon=folium.Icon(color=colors['address'], icon='home', prefix='fa')
-            ).add_to(address_group)
+        # Process address markers (can be multiple addresses per row)
+        addr_lats = safe_eval(row.get('Addr_latitude', []))
+        addr_lons = safe_eval(row.get('Addr_longitude', []))
+        full_addresses = safe_eval(row.get('Full Address', []))
+        
+        # Ensure we have the same number of addresses, lats, and lons
+        max_addr_count = max(len(addr_lats), len(addr_lons), len(full_addresses))
+        
+        for i in range(max_addr_count):
+            # Get address info, using last available if lists are different lengths
+            addr_lat = float(addr_lats[min(i, len(addr_lats)-1)]) if addr_lats else None
+            addr_lon = float(addr_lons[min(i, len(addr_lons)-1)]) if addr_lons else None
+            address_text = full_addresses[min(i, len(full_addresses)-1)] if full_addresses else f"Address {i+1}"
+            
+            if addr_lat is not None and addr_lon is not None:
+                folium.Marker(
+                    location=[addr_lat, addr_lon],
+                    popup=folium.Popup(popup_content, max_width=350),
+                    tooltip=f"Address: {address_text}",
+                    icon=folium.Icon(color=colors['address'], icon='home', prefix='fa')
+                ).add_to(address_group)
         
         # Process parcels
         prcl_lats = safe_eval(row.get('PRCL_latitude', []))
@@ -165,17 +187,22 @@ def create_property_map(excel_file_path: str, output_dir: str, map_filename: str
                 )
         
         # Add parcel center points
-        for i, (lat, lon) in enumerate(zip(prcl_lats, prcl_lons)):
-            if pd.notna(lat) and pd.notna(lon):
-                folium.CircleMarker(
-                    location=[lat, lon],
-                    radius=5,
-                    popup=folium.Popup(f"Parcel {i+1}<br>" + popup_content, max_width=350),
-                    tooltip=f"Parcel {i+1}",
-                    color=colors['parcel_point'],
-                    fill=True,
-                    fillColor=colors['parcel_point']
-                ).add_to(parcel_points_group)
+        for i in range(len(prcl_lats)):
+            if i < len(prcl_lons):
+                try:
+                    lat_float = float(prcl_lats[i])
+                    lon_float = float(prcl_lons[i])
+                    folium.CircleMarker(
+                        location=[lat_float, lon_float],
+                        radius=5,
+                        popup=folium.Popup(f"Parcel {i+1}<br>" + popup_content, max_width=350),
+                        tooltip=f"Parcel {i+1}",
+                        color=colors['parcel_point'],
+                        fill=True,
+                        fillColor=colors['parcel_point']
+                    ).add_to(parcel_points_group)
+                except (ValueError, TypeError):
+                    continue
         
         # Process buildings
         bldg_lats = safe_eval(row.get('BLDG_lattitude', []))  # Note: using your spelling
@@ -195,17 +222,22 @@ def create_property_map(excel_file_path: str, output_dir: str, map_filename: str
                 )
         
         # Add building center points
-        for i, (lat, lon) in enumerate(zip(bldg_lats, bldg_lons)):
-            if pd.notna(lat) and pd.notna(lon):
-                folium.CircleMarker(
-                    location=[lat, lon],
-                    radius=5,
-                    popup=folium.Popup(f"Building {i+1}<br>" + popup_content, max_width=350),
-                    tooltip=f"Building {i+1}",
-                    color=colors['building_point'],
-                    fill=True,
-                    fillColor=colors['building_point']
-                ).add_to(building_points_group)
+        for i in range(len(bldg_lats)):
+            if i < len(bldg_lons):
+                try:
+                    lat_float = float(bldg_lats[i])
+                    lon_float = float(bldg_lons[i])
+                    folium.CircleMarker(
+                        location=[lat_float, lon_float],
+                        radius=5,
+                        popup=folium.Popup(f"Building {i+1}<br>" + popup_content, max_width=350),
+                        tooltip=f"Building {i+1}",
+                        color=colors['building_point'],
+                        fill=True,
+                        fillColor=colors['building_point']
+                    ).add_to(building_points_group)
+                except (ValueError, TypeError):
+                    continue
     
     # Add all feature groups to the map
     address_group.add_to(m)
