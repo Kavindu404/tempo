@@ -1,0 +1,10 @@
+torch>=2.2
+torchvision>=0.17
+pycocotools>=2.0.7
+albumentations>=1.4.7
+opencv-python>=4.9
+numpy>=1.24
+scipy>=1.11
+tqdm>=4.66
+tensorboard>=2.14
+matplotlib>=3.8
