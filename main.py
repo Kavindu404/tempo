@@ -95,20 +95,20 @@ def create_config_from_args(args):
 
 def verify_setup(config):
     """Verify that the setup is correct"""
-    print("🔍 Verifying setup...")
+    print("Verifying setup...")
     
     try:
         verify_config(config)
-        print("✅ Setup verification passed!")
+        print("Setup verification passed!")
         return True
     except Exception as e:
-        print(f"❌ Setup verification failed: {e}")
+        print(f"Setup verification failed: {e}")
         print("\nPlease check your configuration and paths.")
         return False
 
 def launch_single_gpu(config, args):
     """Launch training on single GPU"""
-    print("🚀 Launching single GPU training...")
+    print("Launching single GPU training...")
     
     # Set environment variables
     os.environ['CUDA_VISIBLE_DEVICES'] = '0'
@@ -119,15 +119,15 @@ def launch_single_gpu(config, args):
     try:
         main_worker(0, 1, config)
     except KeyboardInterrupt:
-        print("\n🛑 Training interrupted by user")
+        print("\nTraining interrupted by user")
     except Exception as e:
-        print(f"❌ Training failed: {e}")
+        print(f"Training failed: {e}")
         if args.debug:
             raise
 
 def launch_multi_gpu(config, args):
     """Launch distributed training on multiple GPUs"""
-    print(f"🚀 Launching distributed training on {args.gpus} GPUs...")
+    print(f"Launching distributed training on {args.gpus} GPUs...")
     
     # Set environment variables
     os.environ['MASTER_ADDR'] = args.master_addr
@@ -146,15 +146,15 @@ def launch_multi_gpu(config, args):
             join=True
         )
     except KeyboardInterrupt:
-        print("\n🛑 Training interrupted by user")
+        print("\nTraining interrupted by user")
     except Exception as e:
-        print(f"❌ Training failed: {e}")
+        print(f"Training failed: {e}")
         if args.debug:
             raise
 
 def print_config_summary(config):
     """Print configuration summary"""
-    print("\n📋 Configuration Summary:")
+    print("\nConfiguration Summary:")
     print("=" * 50)
     print(f"Experiment name: {config.exp_name}")
     print(f"Backbone: {config.backbone_type}")
@@ -169,7 +169,7 @@ def print_config_summary(config):
 
 def print_paths_summary(config):
     """Print paths summary"""
-    print("\n📁 Paths:")
+    print("\nPaths:")
     print("=" * 50)
     print(f"Train JSON: {config.train_json_path}")
     print(f"Test JSON: {config.test_json_path}")
@@ -182,7 +182,7 @@ def print_paths_summary(config):
 def main():
     args = parse_args()
     
-    print("🎯 DINOv3 + Mask2Former Training Launcher")
+    print("DINOv3 + Mask2Former Training Launcher")
     print("=" * 60)
     
     # Create configuration
@@ -194,7 +194,7 @@ def main():
     
     # Verify setup
     if not verify_setup(config):
-        print("\n❌ Setup verification failed. Please fix the issues and try again.")
+        print("\nSetup verification failed. Please fix the issues and try again.")
         sys.exit(1)
     
     # Create experiment directories
@@ -203,35 +203,35 @@ def main():
     # Save configuration
     config_save_path = os.path.join(config.exp_log_dir, "launch_config.json")
     save_config(config, config_save_path)
-    print(f"\n💾 Configuration saved to: {config_save_path}")
+    print(f"\nConfiguration saved to: {config_save_path}")
     
     # If verify only, exit here
     if args.verify_only:
-        print("\n✅ Verification completed successfully!")
+        print("\nVerification completed successfully!")
         print("You can now run training by removing the --verify_only flag.")
         return
     
     # Check for resume checkpoint
     if args.resume:
         if not os.path.exists(args.resume):
-            print(f"❌ Resume checkpoint not found: {args.resume}")
+            print(f"Resume checkpoint not found: {args.resume}")
             sys.exit(1)
-        print(f"📂 Will resume from checkpoint: {args.resume}")
+        print(f"Will resume from checkpoint: {args.resume}")
         # Note: Resume functionality would need to be integrated into the training loop
     
     # Launch training
-    print(f"\n🚀 Starting training...")
-    print(f"📊 Monitor training progress in: {config.exp_log_dir}")
-    print(f"💾 Checkpoints will be saved to: {config.exp_checkpoint_dir}")
-    print(f"🖼️  Visualizations will be saved to: {config.exp_viz_dir}")
+    print(f"\nStarting training...")
+    print(f"Monitor training progress in: {config.exp_log_dir}")
+    print(f"Checkpoints will be saved to: {config.exp_checkpoint_dir}")
+    print(f"Visualizations will be saved to: {config.exp_viz_dir}")
     
     if args.gpus == 1:
         launch_single_gpu(config, args)
     else:
         launch_multi_gpu(config, args)
     
-    print("\n🎉 Training completed!")
-    print(f"📈 Check results in: {config.exp_checkpoint_dir}")
+    print("\nTraining completed!")
+    print(f"Check results in: {config.exp_checkpoint_dir}")
 
 if __name__ == '__main__':
     main()
