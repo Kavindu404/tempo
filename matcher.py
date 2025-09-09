@@ -61,13 +61,36 @@ def box_area(boxes):
 
 def dice_loss(inputs, targets, smooth=1.0):
     """Compute dice loss"""
-    inputs = inputs.sigmoid()
-    inputs = inputs.flatten(1)
-    targets = targets.flatten(1)
+    # inputs: [num_queries, 1, H*W] or [num_queries, num_targets, H*W]
+    # targets: [1, num_targets, H*W] or [num_queries, num_targets, H*W]
     
-    intersection = (inputs * targets).sum(1)
-    dice = (2. * intersection + smooth) / (inputs.sum(1) + targets.sum(1) + smooth)
-    return 1 - dice
+    inputs = inputs.sigmoid()
+    
+    # Handle broadcasting for cost computation
+    if inputs.dim() == 3 and targets.dim() == 3:
+        num_queries, _, spatial_dim = inputs.shape
+        _, num_targets, _ = targets.shape
+        
+        # Expand to make them the same shape
+        inputs_expanded = inputs.expand(num_queries, num_targets, spatial_dim)
+        targets_expanded = targets.expand(num_queries, num_targets, spatial_dim)
+        
+        # Flatten last dimension
+        inputs_flat = inputs_expanded.flatten(2)  # [num_queries, num_targets, H*W]
+        targets_flat = targets_expanded.flatten(2)  # [num_queries, num_targets, H*W]
+        
+        # Compute dice loss
+        intersection = (inputs_flat * targets_flat).sum(2)  # [num_queries, num_targets]
+        dice = (2. * intersection + smooth) / (inputs_flat.sum(2) + targets_flat.sum(2) + smooth)
+        return 1 - dice  # [num_queries, num_targets]
+    else:
+        # Original implementation for regular case
+        inputs = inputs.flatten(1)
+        targets = targets.flatten(1)
+        
+        intersection = (inputs * targets).sum(1)
+        dice = (2. * intersection + smooth) / (inputs.sum(1) + targets.sum(1) + smooth)
+        return 1 - dice
 
 def sigmoid_focal_loss(inputs, targets, alpha=0.25, gamma=2.0):
     """Compute sigmoid focal loss"""
