@@ -1,113 +1,89 @@
-import pandas as pd
-import ast
-import folium
-from shapely import wkt
-from shapely.geometry import mapping
+import os
 
-def plot_rows_by_index(excel_path: str, indexes: list, output_dir: str = "maps_by_index"):
-    """
-    Generates individual Folium HTML maps for given row indexes,
-    showing Ecopia, PRCL, and BLDG polygons with a pin marker.
+class Config:
+    # Experiment settings
+    exp_name = "dinov3_mask2former_exp1"
     
-    Parameters:
-        excel_path (str): Path to the Excel file with WKT geometries.
-        indexes (list): List of row indexes to visualize.
-        output_dir (str): Directory where HTML maps will be saved.
-    """
-    import os
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Load Excel file
-    df = pd.read_excel(excel_path)
-
-    # Parse WKT geometries
-    df["Ecopia_geom"] = df["Ecopia_wkt"].apply(lambda x: wkt.loads(x) if pd.notna(x) else None)
-    df["PRCL_geom"] = df["PRCL_WKT"].apply(lambda x: wkt.loads(x) if pd.notna(x) else None)
-    df["BLDG_geom"] = df["BLDG_WKT"].apply(lambda x: wkt.loads(x) if pd.notna(x) else None)
-
-    # Parse latitude and longitude from string lists
-    def safe_parse(coord):
-        if pd.isna(coord):
-            return None
-        try:
-            val = ast.literal_eval(coord)
-            return float(val[0]) if isinstance(val, list) and val else None
-        except:
-            return None
-
-    df["lat"] = df["Addr_latitude"].apply(safe_parse)
-    df["lon"] = df["Addr_longitude"].apply(safe_parse)
-
-    # Polygon colors
-    color_map = {
-        "Ecopia": "blue",
-        "PRCL": "green",
-        "BLDG": "red"
-    }
-
-    # Iterate over given indexes
-    for idx in indexes:
-        if idx not in df.index:
-            print(f"⚠️ Index {idx} not found, skipping.")
-            continue
-
-        row = df.loc[idx]
-
-        # Center map on lat/lon if available, else use Ecopia polygon centroid, else default
-        if pd.notna(row["lat"]) and pd.notna(row["lon"]):
-            map_center = [row["lat"], row["lon"]]
-        elif row["Ecopia_geom"] and not row["Ecopia_geom"].is_empty:
-            centroid = row["Ecopia_geom"].centroid
-            map_center = [centroid.y, centroid.x]
-        else:
-            map_center = [37.0902, -95.7129]  # Default center of the US
-
-        m = folium.Map(location=map_center, zoom_start=18, tiles="cartodbpositron")
-
-        # Helper to add polygon layers
-        def add_polygon_layer(geom, label, color):
-            if geom and not geom.is_empty:
-                folium.GeoJson(
-                    data={
-                        "type": "Feature",
-                        "geometry": {
-                            "type": geom.geom_type,
-                            "coordinates": mapping(geom)["coordinates"],
-                        },
-                    },
-                    style_function=lambda x, color=color: {
-                        "fillColor": color,
-                        "color": color,
-                        "weight": 2,
-                        "fillOpacity": 0.2,
-                    },
-                    name=label,
-                    tooltip=f"{label} Polygon - Row {idx}",
-                ).add_to(m)
-
-        # Add Ecopia, PRCL, and BLDG polygons
-        add_polygon_layer(row["Ecopia_geom"], "Ecopia", color_map["Ecopia"])
-        add_polygon_layer(row["PRCL_geom"], "PRCL", color_map["PRCL"])
-        add_polygon_layer(row["BLDG_geom"], "BLDG", color_map["BLDG"])
-
-        # Add pin marker
-        if pd.notna(row["lat"]) and pd.notna(row["lon"]):
-            folium.CircleMarker(
-                location=[row["lat"], row["lon"]],
-                radius=6,
-                color="black",
-                fill=True,
-                fill_color="yellow",
-                fill_opacity=0.9,
-                tooltip=f"Row {idx}\nLat: {row['lat']}, Lon: {row['lon']}"
-            ).add_to(m)
-
-        # Add layer toggle
-        folium.LayerControl().add_to(m)
-
-        # Save map per index
-        output_file = os.path.join(output_dir, f"row_{idx}.html")
-        m.save(output_file)
-        print(f"✅ Saved map for row {idx}: {output_file}")
-
-    print(f"\nAll maps saved in: {output_dir}")
+    # Dataset settings
+    train_json_path = "/path/to/train_annotations.json"
+    test_json_path = "/path/to/test_annotations.json"
+    image_dir = "/path/to/images"
+    num_classes = 1  # Single class dataset
+    
+    # DINOv3 backbone settings
+    dinov3_repo_dir = "/path/to/dinov3/repo"
+    backbone_weights_dir = "/path/to/backbone/weights"
+    backbone_type = "dinov3_vitl16"  # Options: dinov3_vits16, dinov3_vitb16, dinov3_vitl16, dinov3_vith16plus, dinov3_vit7b16, dinov3_convnext_*
+    freeze_backbone = False  # Set to True to freeze backbone parameters
+    
+    # Model settings
+    hidden_dim = 256
+    num_queries = 100
+    num_encoder_layers = 6
+    num_decoder_layers = 6
+    num_heads = 8
+    dropout = 0.1
+    activation = "relu"
+    
+    # Training settings
+    batch_size = 2  # Per GPU
+    num_epochs = 100
+    learning_rate = 1e-4
+    weight_decay = 1e-4
+    gradient_clip_max_norm = 0.1
+    
+    # Data augmentation settings
+    image_size = (1024, 1024)
+    normalize_mean = [0.485, 0.456, 0.406]
+    normalize_std = [0.229, 0.224, 0.225]
+    
+    # Loss weights
+    mask_loss_weight = 20.0
+    dice_loss_weight = 1.0
+    cls_loss_weight = 2.0
+    bbox_loss_weight = 5.0
+    giou_loss_weight = 2.0
+    
+    # Evaluation settings
+    eval_threshold = 0.5
+    
+    # Visualization settings
+    num_viz_samples = 10  # Number of visualization samples to save per epoch
+    viz_threshold = 0.5
+    
+    # Distributed training
+    world_size = 8  # Number of GPUs
+    
+    # Paths (will be created if they don't exist)
+    checkpoint_dir = "checkpoints"
+    log_dir = "logs"
+    viz_dir = "viz"
+    
+    @property
+    def exp_checkpoint_dir(self):
+        return os.path.join(self.checkpoint_dir, self.exp_name)
+    
+    @property
+    def exp_log_dir(self):
+        return os.path.join(self.log_dir, self.exp_name)
+    
+    @property
+    def exp_viz_dir(self):
+        return os.path.join(self.viz_dir, self.exp_name)
+    
+    @property
+    def backbone_weights_path(self):
+        # Map backbone type to expected weight file
+        weight_mapping = {
+            "dinov3_vits16": "dinov3_vits16_300ep.pth",
+            "dinov3_vitb16": "dinov3_vitb16_300ep.pth", 
+            "dinov3_vitl16": "dinov3_vitl16_300ep.pth",
+            "dinov3_vith16plus": "dinov3_vith16plus_300ep.pth",
+            "dinov3_vit7b16": "dinov3_vit7b16_300ep.pth",
+            "dinov3_convnext_tiny": "dinov3_convnext_tiny_300ep.pth",
+            "dinov3_convnext_small": "dinov3_convnext_small_300ep.pth",
+            "dinov3_convnext_base": "dinov3_convnext_base_300ep.pth",
+            "dinov3_convnext_large": "dinov3_convnext_large_300ep.pth",
+        }
+        weight_file = weight_mapping.get(self.backbone_type, f"{self.backbone_type}.pth")
+        return os.path.join(self.backbone_weights_dir, weight_file)
