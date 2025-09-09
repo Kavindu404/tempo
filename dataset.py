@@ -1,184 +1,155 @@
-import os, random, math, cv2
-import numpy as np
+import os
+import json
 import torch
+import numpy as np
+from PIL import Image
 from torch.utils.data import Dataset
-from pycocotools.coco import COCO
 import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import pycocotools.mask as mask_util
+from typing import Dict, List, Tuple
 
-def _albumentations_train(img_size):
-    return A.Compose([
-        A.RandomResizedCrop(img_size, img_size, scale=(0.8, 1.0), ratio=(0.8, 1.25), p=1.0),
-        A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.1),
-        A.ColorJitter(0.2, 0.2, 0.2, 0.05, p=0.3),
-        A.GaussianBlur(blur_limit=(3, 5), p=0.15),
-        A.CoarseDropout(max_holes=8, max_height=int(img_size*0.08), max_width=int(img_size*0.08),
-                        min_holes=1, fill_value=0, p=0.15),
-        A.Normalize()
-    ], is_check_shapes=False)
-
-def _albumentations_val(img_size):
-    return A.Compose([
-        A.LongestMaxSize(img_size),
-        A.PadIfNeeded(img_size, img_size, border_mode=cv2.BORDER_CONSTANT, value=0),
-        A.Normalize()
-    ], is_check_shapes=False)
-
-def _masks_to_boxes(masks: np.ndarray):
-    # masks: [N,H,W] bool/uint8
-    boxes = []
-    for m in masks:
-        ys, xs = np.where(m > 0)
-        if len(xs)==0 or len(ys)==0:
-            boxes.append([0,0,0,0])
-        else:
-            x0, y0, x1, y1 = xs.min(), ys.min(), xs.max()+1, ys.max()+1
-            boxes.append([x0, y0, x1, y1])
-    return np.array(boxes, dtype=np.float32)
-
-class COCOMaskDataset(Dataset):
-    """
-    Returns:
-        image: FloatTensor [3,H,W] in 0..1 after denorm later
-        target: dict{
-            'masks': BoolTensor [N,H,W],
-            'labels': LongTensor [N],
-            'boxes': FloatTensor [N,4] xyxy,
-            'image_id': int,
-            'file_name': str,
-            'size': (H,W)
-        }
-    """
-    def __init__(self, img_dir, ann_file, img_size=1024, is_train=True,
-                 use_mosaic=True, mosaic_prob=0.5, use_mixup=True, mixup_prob=0.3, mixup_alpha=0.5):
-        self.img_dir = img_dir
-        self.coco = COCO(ann_file)
-        self.img_ids = list(sorted(self.coco.imgs.keys()))
-        self.img_size = img_size
+class InstanceSegmentationDataset(Dataset):
+    def __init__(self, json_path: str, image_dir: str, transforms=None, is_train: bool = True):
+        self.image_dir = image_dir
+        self.transforms = transforms
         self.is_train = is_train
-
-        self.use_mosaic = use_mosaic
-        self.mosaic_prob = mosaic_prob
-        self.use_mixup = use_mixup
-        self.mixup_prob = mixup_prob
-        self.mixup_alpha = mixup_alpha
-
-        self.tf_train = _albumentations_train(img_size)
-        self.tf_val   = _albumentations_val(img_size)
-
-    def __len__(self): return len(self.img_ids)
-
-    # ---------- helpers ----------
-    def _load_img_target(self, img_id):
-        info = self.coco.loadImgs(img_id)[0]
-        path = os.path.join(self.img_dir, info['file_name'])
-        im = cv2.imread(path)
-        if im is None:
-            raise FileNotFoundError(path)
-        im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-        H, W = im.shape[:2]
-
-        ann_ids = self.coco.getAnnIds(imgIds=img_id, iscrowd=None)
-        anns = self.coco.loadAnns(ann_ids)
-        masks, labels = [], []
-        for a in anns:
-            if a.get("iscrowd", 0) == 1:
-                continue
-            m = self.coco.annToMask(a).astype(np.uint8)
-            if m.sum() == 0:  # skip empty
-                continue
-            masks.append(m)
-            labels.append(int(a["category_id"]))
-
-        masks = np.stack(masks, axis=0) if len(masks)>0 else np.zeros((0, H, W), dtype=np.uint8)
-        labels = np.array(labels, dtype=np.int64) if len(labels)>0 else np.zeros((0,), dtype=np.int64)
-        boxes  = _masks_to_boxes(masks) if len(masks)>0 else np.zeros((0,4), dtype=np.float32)
-        return im, masks, labels, boxes, info['file_name'], H, W
-
-    def _apply_tf(self, im, masks):
-        # Albumentations expects list of masks
-        tf = self.tf_train if self.is_train else self.tf_val
-        mlist = [m for m in masks]
-        out = tf(image=im, masks=mlist)
-        im = out['image']
-        masks = np.stack(out['masks'], axis=0) if len(out['masks'])>0 else np.zeros((0, self.img_size, self.img_size), dtype=np.uint8)
-        return im, masks
-
-    def _mosaic(self):
-        ids = random.sample(self.img_ids, k=4)
-        s = self.img_size
-        canvas = np.zeros((s, s, 3), dtype=np.uint8)
-        out_masks = []
-        out_labels = []
-        # 2x2 grid
-        quadrants = [(0,0),(0,s//2),(s//2,0),(s//2,s//2)]
-        for q,(y0,x0) in enumerate(quadrants):
-            im, masks, labels, _, _, _, _ = self._load_img_target(ids[q])
-            # resize to half
-            im = cv2.resize(im, (s//2, s//2), interpolation=cv2.INTER_LINEAR)
-            canvas[y0:y0+s//2, x0:x0+s//2] = im
-            if len(masks)>0:
-                ms = np.stack([cv2.resize(m.astype(np.uint8), (s//2, s//2), interpolation=cv2.INTER_NEAREST) for m in masks],0)
-                # place on big canvas
-                placed = np.zeros((ms.shape[0], s, s), dtype=np.uint8)
-                placed[:, y0:y0+s//2, x0:x0+s//2] = ms
-                out_masks.append(placed)
-                out_labels.append(labels)
-        if len(out_masks)>0:
-            out_masks = np.concatenate(out_masks, axis=0)
-            out_labels = np.concatenate(out_labels, axis=0)
-        else:
-            out_masks = np.zeros((0, s, s), dtype=np.uint8)
-            out_labels = np.zeros((0,), dtype=np.int64)
-        return canvas, out_masks, out_labels
-
-    def _mixup(self, a_img, a_masks, a_labels):
-        # sample a partner and overlay instances; image mix is linear blend (alpha)
-        b_id = random.choice(self.img_ids)
-        b_img, b_masks, b_labels, _, _, _, _ = self._load_img_target(b_id)
-        # resize both to img_size via val tf (deterministic sizing)
-        a_img, a_masks = self._apply_tf(a_img, a_masks)
-        b_img, b_masks = self._apply_tf(b_img, b_masks)
-        alpha = self.mixup_alpha
-        img = (alpha * a_img + (1 - alpha) * b_img).astype(np.uint8)
-        if len(b_masks)>0:
-            masks = np.concatenate([a_masks, b_masks], axis=0)
-            labels = np.concatenate([a_labels, b_labels], axis=0)
-        else:
-            masks, labels = a_masks, a_labels
-        return img, masks, labels
-
-    # ---------- main ----------
+        
+        # Load annotations
+        with open(json_path, 'r') as f:
+            self.coco_data = json.load(f)
+        
+        # Create image id to annotations mapping
+        self.image_id_to_anns = {}
+        for ann in self.coco_data['annotations']:
+            image_id = ann['image_id']
+            if image_id not in self.image_id_to_anns:
+                self.image_id_to_anns[image_id] = []
+            self.image_id_to_anns[image_id].append(ann)
+        
+        # Filter images that have annotations
+        self.images = [img for img in self.coco_data['images'] 
+                      if img['id'] in self.image_id_to_anns]
+        
+    def __len__(self):
+        return len(self.images)
+    
     def __getitem__(self, idx):
-        img_id = self.img_ids[idx]
-        im, masks, labels, boxes, file_name, H, W = self._load_img_target(img_id)
-
-        # Training-time composite augs
-        if self.is_train and self.use_mosaic and random.random() < self.mosaic_prob:
-            im, masks, labels = self._mosaic()
-
-        if self.is_train and self.use_mixup and random.random() < self.mixup_prob:
-            im, masks, labels = self._mixup(im, masks, labels)
-
-        # Albumentations pipeline (resize/normalize/etc.)
-        im, masks = self._apply_tf(im, masks)
-
-        # Recompute boxes after geometric augs
-        boxes = _masks_to_boxes(masks) if len(masks)>0 else np.zeros((0,4), dtype=np.float32)
-
-        # Torchify
-        image = torch.from_numpy(im.transpose(2,0,1)).float()  # [3,H,W]
+        # Get image info
+        image_info = self.images[idx]
+        image_id = image_info['id']
+        image_path = os.path.join(self.image_dir, image_info['file_name'])
+        
+        # Load image
+        image = Image.open(image_path).convert('RGB')
+        image = np.array(image)
+        
+        # Get annotations for this image
+        annotations = self.image_id_to_anns.get(image_id, [])
+        
+        # Prepare masks and labels
+        masks = []
+        labels = []
+        bboxes = []
+        areas = []
+        
+        for ann in annotations:
+            # Convert segmentation to mask
+            if isinstance(ann['segmentation'], list):
+                # Polygon format
+                from pycocotools import mask as mask_utils
+                rle = mask_utils.frPyObjects(ann['segmentation'], 
+                                           image_info['height'], 
+                                           image_info['width'])
+                mask = mask_utils.decode(rle)
+                if len(mask.shape) == 3:
+                    mask = mask.sum(axis=2) > 0
+            else:
+                # RLE format
+                mask = mask_util.decode(ann['segmentation'])
+            
+            masks.append(mask.astype(np.uint8))
+            labels.append(1)  # Single class, always 1
+            bboxes.append(ann['bbox'])  # [x, y, w, h]
+            areas.append(ann['area'])
+        
+        # Convert to proper format
+        if len(masks) == 0:
+            # Handle images with no annotations
+            masks = np.zeros((0, image_info['height'], image_info['width']), dtype=np.uint8)
+            labels = []
+            bboxes = []
+            areas = []
+        else:
+            masks = np.stack(masks, axis=0)
+        
+        # Apply transformations
+        if self.transforms:
+            # Prepare masks for albumentations (expects list of 2D arrays)
+            mask_list = [masks[i] for i in range(masks.shape[0])] if masks.shape[0] > 0 else []
+            
+            transformed = self.transforms(
+                image=image,
+                masks=mask_list,
+                bboxes=[(box[0], box[1], box[0] + box[2], box[1] + box[3]) for box in bboxes],
+                category_ids=labels
+            )
+            
+            image = transformed['image']
+            mask_list = transformed['masks']
+            transformed_bboxes = transformed['bboxes']
+            labels = transformed['category_ids']
+            
+            # Convert back to numpy array
+            if len(mask_list) > 0:
+                masks = np.stack(mask_list, axis=0)
+                # Convert bboxes back to [x, y, w, h] format
+                bboxes = [[box[0], box[1], box[2] - box[0], box[3] - box[1]] 
+                         for box in transformed_bboxes]
+            else:
+                masks = np.zeros((0, image.shape[1], image.shape[2]), dtype=np.uint8)
+                bboxes = []
+        
+        # Convert to tensors
+        if not isinstance(image, torch.Tensor):
+            image = torch.from_numpy(image).float()
+        
+        # Prepare target dictionary
         target = {
-            "masks": torch.from_numpy(masks.astype(np.bool_)),
-            "labels": torch.from_numpy(labels.astype(np.int64)),
-            "boxes": torch.from_numpy(boxes.astype(np.float32)),
-            "image_id": int(img_id),
-            "file_name": file_name,
-            "size": (self.img_size, self.img_size)
+            'masks': torch.from_numpy(masks).float() if masks.shape[0] > 0 else torch.zeros((0, masks.shape[1], masks.shape[2])),
+            'labels': torch.tensor(labels, dtype=torch.long),
+            'boxes': torch.tensor(bboxes, dtype=torch.float32) if len(bboxes) > 0 else torch.zeros((0, 4)),
+            'image_id': torch.tensor(image_id),
+            'area': torch.tensor(areas, dtype=torch.float32) if len(areas) > 0 else torch.zeros((0,)),
+            'iscrowd': torch.zeros(len(labels), dtype=torch.uint8),
+            'orig_size': torch.tensor([image_info['height'], image_info['width']]),
+            'size': torch.tensor([image.shape[1], image.shape[2]])
         }
+        
         return image, target
 
+def get_transforms(config, is_train=True):
+    if is_train:
+        transform = A.Compose([
+            A.Resize(config.image_size[0], config.image_size[1]),
+            A.HorizontalFlip(p=0.5),
+            A.RandomBrightnessContrast(p=0.2),
+            A.RandomRotate90(p=0.2),
+            A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.3),
+            A.Normalize(mean=config.normalize_mean, std=config.normalize_std),
+            ToTensorV2()
+        ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category_ids']))
+    else:
+        transform = A.Compose([
+            A.Resize(config.image_size[0], config.image_size[1]),
+            A.Normalize(mean=config.normalize_mean, std=config.normalize_std),
+            ToTensorV2()
+        ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category_ids']))
+    
+    return transform
+
 def collate_fn(batch):
+    """Custom collate function to handle variable number of instances"""
     images, targets = zip(*batch)
     images = torch.stack(images, dim=0)
     return images, list(targets)
