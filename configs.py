@@ -51,9 +51,6 @@ class Config:
     num_viz_samples = 10  # Number of visualization samples to save per epoch
     viz_threshold = 0.5
     
-    # Distributed training
-    world_size = 8  # Number of GPUs
-    
     # Paths (will be created if they don't exist)
     checkpoint_dir = "checkpoints"
     log_dir = "logs"
