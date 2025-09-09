@@ -202,19 +202,13 @@ class HungarianMatcher(torch.nn.Module):
             
             # Flatten for cost computation
             out_mask_flat = out_mask_resized.flatten(1)  # [num_queries, H*W]
-            tgt_mask_flat = tgt_mask.flatten(1)  # [num_targets, H*W]
+            tgt_mask_flat = tgt_mask.flatten(1).float()  # [num_targets, H*W]
             
-            # Focal loss cost
-            cost_mask = sigmoid_focal_loss(
-                out_mask_flat[:, None, :], 
-                tgt_mask_flat[None, :, :].float()
-            ).mean(-1)  # [num_queries, num_targets]
+            # Focal loss cost using specialized function
+            cost_mask = compute_mask_focal_loss_cost(out_mask_flat, tgt_mask_flat)
             
-            # Dice loss cost  
-            cost_dice = dice_loss(
-                out_mask_flat[:, None, :], 
-                tgt_mask_flat[None, :, :].float()
-            )  # [num_queries, num_targets]
+            # Dice loss cost using specialized function
+            cost_dice = compute_mask_dice_loss_cost(out_mask_flat, tgt_mask_flat)
         else:
             cost_mask = torch.zeros(out_prob.shape[0], 0, device=out_prob.device)
             cost_dice = torch.zeros(out_prob.shape[0], 0, device=out_prob.device)
