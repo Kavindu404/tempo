@@ -189,7 +189,7 @@ def main():
     config = create_config_from_args(args)
     
     # Print summaries
-    print_config_summary(config)
+    print_config_summary(config, args)
     print_paths_summary(config)
     
     # Verify setup
