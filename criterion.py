@@ -91,11 +91,22 @@ class SetCriterion(nn.Module):
         src_masks = src_masks.flatten(1)  # [num_matched, H*W]
         target_masks = target_masks.flatten(1).float()  # [num_matched, H*W]
         
-        # Focal loss
-        loss_mask = sigmoid_focal_loss(src_masks, target_masks).mean()
+        # For matched pairs, inputs and targets should have the same shape
+        # No need for broadcasting here since we have matched pairs
         
-        # Dice loss
-        loss_dice = dice_loss(src_masks, target_masks).mean()
+        # Focal loss - use simple BCE focal loss for matched pairs
+        prob = src_masks.sigmoid()
+        ce_loss = F.binary_cross_entropy_with_logits(src_masks, target_masks, reduction="none")
+        p_t = prob * target_masks + (1 - prob) * (1 - target_masks)
+        focal_loss = ce_loss * ((1 - p_t) ** 2.0)  # gamma=2.0
+        alpha = 0.25
+        alpha_t = alpha * target_masks + (1 - alpha) * (1 - target_masks)
+        loss_mask = (alpha_t * focal_loss).mean()
+        
+        # Dice loss - simple dice for matched pairs
+        intersection = (src_masks.sigmoid() * target_masks).sum(1)
+        dice = (2. * intersection + 1.0) / (src_masks.sigmoid().sum(1) + target_masks.sum(1) + 1.0)
+        loss_dice = (1 - dice).mean()
         
         losses = {
             "loss_mask": loss_mask,
