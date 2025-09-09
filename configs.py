@@ -1,86 +1,66 @@
-import os
+from dataclasses import dataclass, field
+from typing import Tuple, Optional
 
+@dataclass
 class Config:
-    # Experiment settings
-    exp_name = "dinov3_mask2former_exp1"
-    
-    # Dataset settings
-    train_json_path = "/path/to/train_annotations.json"
-    test_json_path = "/path/to/test_annotations.json"
-    image_dir = "/path/to/images"
-    num_classes = 1  # Single class dataset
-    
-    # DINOv3 backbone settings
-    dinov3_repo_dir = "/path/to/dinov3/repo"
-    backbone_weights_dir = "/path/to/backbone/weights"
-    backbone_type = "dinov3_vitl16"  # Options: dinov3_vits16, dinov3_vitb16, dinov3_vitl16, dinov3_vith16plus, dinov3_vit7b16, dinov3_convnext_*
-    freeze_backbone = False  # Set to True to freeze backbone parameters
-    
-    # Model settings
-    hidden_dim = 256
-    num_queries = 100
-    num_encoder_layers = 6
-    num_decoder_layers = 6
-    num_heads = 8
-    dropout = 0.1
-    activation = "relu"
-    
-    # Training settings
-    batch_size = 2  # Per GPU
-    num_epochs = 100
-    learning_rate = 1e-4
-    weight_decay = 1e-4
-    gradient_clip_max_norm = 0.1
-    
-    # Data augmentation settings
-    image_size = (1024, 1024)
-    normalize_mean = [0.485, 0.456, 0.406]
-    normalize_std = [0.229, 0.224, 0.225]
-    
-    # Loss weights
-    mask_loss_weight = 20.0
-    dice_loss_weight = 1.0
-    cls_loss_weight = 2.0
-    bbox_loss_weight = 5.0
-    giou_loss_weight = 2.0
-    
-    # Evaluation settings
-    eval_threshold = 0.5
-    
-    # Visualization settings
-    num_viz_samples = 10  # Number of visualization samples to save per epoch
-    viz_threshold = 0.5
-    
-    # Paths (will be created if they don't exist)
-    checkpoint_dir = "checkpoints"
-    log_dir = "logs"
-    viz_dir = "viz"
-    
-    @property
-    def exp_checkpoint_dir(self):
-        return os.path.join(self.checkpoint_dir, self.exp_name)
-    
-    @property
-    def exp_log_dir(self):
-        return os.path.join(self.log_dir, self.exp_name)
-    
-    @property
-    def exp_viz_dir(self):
-        return os.path.join(self.viz_dir, self.exp_name)
-    
-    @property
-    def backbone_weights_path(self):
-        # Map backbone type to expected weight file
-        weight_mapping = {
-            "dinov3_vits16": "dinov3_vits16_300ep.pth",
-            "dinov3_vitb16": "dinov3_vitb16_300ep.pth", 
-            "dinov3_vitl16": "dinov3_vitl16_300ep.pth",
-            "dinov3_vith16plus": "dinov3_vith16plus_300ep.pth",
-            "dinov3_vit7b16": "dinov3_vit7b16_300ep.pth",
-            "dinov3_convnext_tiny": "dinov3_convnext_tiny_300ep.pth",
-            "dinov3_convnext_small": "dinov3_convnext_small_300ep.pth",
-            "dinov3_convnext_base": "dinov3_convnext_base_300ep.pth",
-            "dinov3_convnext_large": "dinov3_convnext_large_300ep.pth",
-        }
-        weight_file = weight_mapping.get(self.backbone_type, f"{self.backbone_type}.pth")
-        return os.path.join(self.backbone_weights_dir, weight_file)
+    # --- Data ---
+    train_json: str = "/path/to/train.json"
+    val_json: str = "/path/to/val.json"
+    image_dir: str = "/path/to/images"
+
+    # --- Experiment ---
+    exp_name: str = "dinov3_m2f_singlecls"
+    output_root: str = "./"
+    seed: int = 42
+
+    # --- Backbone ---
+    dinov3_repo_dir: str = "/path/to/dinov3_repo"
+    backbone_name: str = "dinov3_vitl16"   # e.g., dinov3_vits16, dinov3_vitb16, dinov3_vitl16, dinov3_vit7b16, convnext variants
+    backbone_weights: str = "/path/to/checkpoint.pth"
+    freeze_backbone: bool = True
+    out_stride: int = 16   # feature stride target (used in simple pixel decoder)
+
+    # --- Model/Head ---
+    hidden_dim: int = 256
+    num_queries: int = 100
+    num_decoder_layers: int = 6
+    num_classes: int = 1   # single foreground class (we add a no-object internally)
+    mask_dim: int = 256    # channels for mask embeddings
+    use_bias: bool = True
+
+    # --- Loss ---
+    cls_alpha: float = 2.0   # focal
+    cls_gamma: float = 2.0
+    cls_weight: float = 2.0
+    bbox_l1_weight: float = 5.0
+    bbox_giou_weight: float = 2.0
+    mask_focal_weight: float = 2.0
+    mask_dice_weight: float = 5.0
+    no_object_weight: float = 0.1
+
+    # --- Optimization ---
+    epochs: int = 50
+    batch_size: int = 2
+    lr: float = 1e-4
+    wd: float = 1e-4
+    backbone_lr_mult: float = 0.1
+    warmup_epochs: int = 1
+    num_workers: int = 8
+    grad_clip_norm: float = 1.0
+    amp: bool = True
+
+    # --- Augmentations ---
+    image_size: Tuple[int, int] = (1024, 1024)
+    augment: bool = True
+
+    # --- Viz ---
+    viz_n_per_epoch: int = 10
+    viz_score_thresh: float = 0.5
+
+    # --- DDP ---
+    backend: str = "nccl"
+    find_unused_params: bool = False
+    dist_url: Optional[str] = None  # set by launcher
+
+    # --- Eval ---
+    eval_every_epoch: bool = True
