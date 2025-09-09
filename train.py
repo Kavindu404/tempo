@@ -103,9 +103,23 @@ def main_worker(rank, world_size, config):
     # Set device
     device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
     
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Train DINOv3 Mask2Former')
+    parser.add_argument('--config', type=str, help='Path to config file (optional)')
+    args = parser.parse_args()
+    
+    # Load config
+    config = Config()
+    
+    # Override config with command line arguments if provided
+    if args.config:
+        # Load config from file if needed
+        pass
+    
     if is_main_process():
         print(f"Using device: {device}")
         print(f"Training with {world_size} GPUs")
+        print(f"Rank: {rank}, Local rank: {local_rank}")
         print(f"Experiment name: {config.exp_name}")
     
     # Create directories
@@ -129,7 +143,7 @@ def main_worker(rank, world_size, config):
     
     # Wrap model with DDP
     if world_size > 1:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     
     # Create criterion
     criterion, weight_dict = build_criterion(config)
@@ -230,50 +244,7 @@ def main_worker(rank, world_size, config):
         print(f"Training completed! Best mAP: {best_mAP:.4f}")
     
     # Cleanup
-    if world_size > 1:
-        cleanup_distributed()
-
-def main():
-    """Main function"""
-    parser = argparse.ArgumentParser(description='Train DINOv3 Mask2Former')
-    parser.add_argument('--config', type=str, help='Path to config file (optional)')
-    parser.add_argument('--world_size', type=int, default=8, help='Number of GPUs')
-    args = parser.parse_args()
-    
-    # Load config
-    config = Config()
-    
-    # Override config with command line arguments if provided
-    if args.config:
-        # Load config from file if needed
-        pass
-    
-    config.world_size = args.world_size
-    
-    # Validate config
-    assert os.path.exists(config.train_json_path), f"Train JSON not found: {config.train_json_path}"
-    assert os.path.exists(config.test_json_path), f"Test JSON not found: {config.test_json_path}"
-    assert os.path.exists(config.image_dir), f"Image directory not found: {config.image_dir}"
-    assert os.path.exists(config.dinov3_repo_dir), f"DINOv3 repo not found: {config.dinov3_repo_dir}"
-    assert os.path.exists(config.backbone_weights_path), f"Backbone weights not found: {config.backbone_weights_path}"
-    
-    if is_main_process():
-        print("Configuration:")
-        for key, value in config.__dict__.items():
-            if not key.startswith('_'):
-                print(f"  {key}: {value}")
-        print()
-    
-    # Launch distributed training
-    if config.world_size > 1:
-        mp.spawn(
-            main_worker,
-            args=(config.world_size, config),
-            nprocs=config.world_size,
-            join=True
-        )
-    else:
-        main_worker(0, 1, config)
+    cleanup_distributed()
 
 if __name__ == '__main__':
     main()
