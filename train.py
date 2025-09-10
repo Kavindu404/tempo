@@ -1,179 +1,156 @@
 import os
-import json
-import math
-import time
-import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
+from tqdm import tqdm
 
-from config import Config
-from dataset import CocoSingleClassDataset, collate_fn
-from matcher import HungarianMatcher
+from dataset import CustomDataset
+from model import DINOv3Mask2Former
 from criterion import SetCriterion
-from model import DINOv3Backbone, Mask2FormerLite
-from engine import train_one_epoch, evaluate, postprocess
-from utils import init_distributed_mode, is_main_process, mkdir_p, set_seed
-from visualizer import save_visualizations
+from matcher import HungarianMatcher
+from visualizer import Visualizer
+from engine import coco_evaluate
+from config import Config
+from utils import save_checkpoint, setup_logger
 
-def build_model(cfg: Config, device):
-    backbone = DINOv3Backbone(
-        repo_dir=cfg.dinov3_repo_dir,
-        backbone_name=cfg.backbone_name,
-        weights_path=cfg.backbone_weights,
-        freeze=cfg.freeze_backbone,
-        out_stride=cfg.out_stride,
+def setup_ddp(rank, world_size):
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+def cleanup_ddp():
+    dist.destroy_process_group()
+
+def main(rank, world_size, config):
+    setup_ddp(rank, world_size)
+
+    # Logger setup
+    logger = setup_logger(os.path.join("logs", config.experiment_name))
+    if rank == 0:
+        logger.info("Starting training with DINOv3 + Mask2Former")
+
+    # Dataset & Dataloader
+    train_dataset = CustomDataset(
+        json_path=config.train_json,
+        image_dir=config.image_dir,
+        transforms=True
     )
-    model = Mask2FormerLite(
-        backbone=backbone,
-        num_classes=cfg.num_classes,
-        hidden_dim=cfg.hidden_dim,
-        num_queries=cfg.num_queries,
-        num_decoder_layers=cfg.num_decoder_layers,
-        mask_dim=cfg.mask_dim,
-        use_bias=cfg.use_bias,
+    val_dataset = CustomDataset(
+        json_path=config.val_json,
+        image_dir=config.image_dir,
+        transforms=False
     )
-    return model.to(device)
 
-def main():
-    cfg = Config()
-    set_seed(cfg.seed)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
 
-    # DDP
-    try:
-        rank, world_size, local_gpu = init_distributed_mode(cfg.backend)
-    except Exception:
-        rank, world_size, local_gpu = (0,1,0)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        sampler=train_sampler,
+        num_workers=config.num_workers,
+        pin_memory=True
+    )
 
-    device = torch.device("cuda", local_gpu) if torch.cuda.is_available() else torch.device("cpu")
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        sampler=val_sampler,
+        num_workers=config.num_workers,
+        pin_memory=True
+    )
 
-    # Dirs
-    out_logs = os.path.join(cfg.output_root, "logs", cfg.exp_name)
-    out_ckpt = os.path.join(cfg.output_root, "checkpoints", cfg.exp_name)
-    out_viz  = os.path.join(cfg.output_root, "viz", cfg.exp_name)
-    if is_main_process():
-        mkdir_p(out_logs); mkdir_p(out_ckpt); mkdir_p(out_viz)
+    # Model
+    model = DINOv3Mask2Former(config)
+    model = model.to(rank)
+    model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
 
-    # Data
-    train_set = CocoSingleClassDataset(cfg.train_json, cfg.image_dir, image_size=cfg.image_size, augment=cfg.augment)
-    val_set   = CocoSingleClassDataset(cfg.val_json,   cfg.image_dir, image_size=cfg.image_size, augment=False)
+    # Matcher & Criterion
+    matcher = HungarianMatcher(cost_class=1, cost_bbox=5, cost_giou=2)
+    criterion = SetCriterion(
+        config.num_classes,
+        matcher=matcher,
+        weight_dict={"loss_ce": 1, "loss_bbox": 5, "loss_giou": 2, "loss_mask": 1},
+        eos_coef=0.1,
+    ).to(rank)
 
-    train_sampler = DistributedSampler(train_set, shuffle=True) if world_size>1 else None
-    val_sampler   = DistributedSampler(val_set, shuffle=False) if world_size>1 else None
+    # Optimizer & Scheduler
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.lr,
+        weight_decay=config.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config.lr_drop, gamma=0.1)
 
-    train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=(train_sampler is None),
-                              sampler=train_sampler, num_workers=cfg.num_workers, pin_memory=True, collate_fn=collate_fn, drop_last=True)
-    val_loader   = DataLoader(val_set, batch_size=cfg.batch_size, shuffle=False,
-                              sampler=val_sampler, num_workers=cfg.num_workers, pin_memory=True, collate_fn=collate_fn)
+    # Visualizer
+    if rank == 0:
+        viz_dir = os.path.join("viz", config.experiment_name)
+        os.makedirs(viz_dir, exist_ok=True)
+        visualizer = Visualizer(config, viz_dir)
+    else:
+        visualizer = None
 
-    # Model/loss
-    model = build_model(cfg, device)
-    matcher = HungarianMatcher(cls_cost=cfg.cls_weight, bbox_cost=cfg.bbox_l1_weight,
-                               giou_cost=cfg.bbox_giou_weight, mask_cost=cfg.mask_focal_weight, dice_cost=cfg.mask_dice_weight)
-    weights = {"cls": cfg.cls_weight, "bbox": cfg.bbox_l1_weight, "giou": cfg.bbox_giou_weight,
-               "mask_focal": cfg.mask_focal_weight, "mask_dice": cfg.mask_dice_weight}
-    criterion = SetCriterion(cfg.num_classes, matcher, weights, no_object_weight=cfg.no_object_weight,
-                             cls_alpha=cfg.cls_alpha, cls_gamma=cfg.cls_gamma).to(device)
+    # Training Loop
+    best_map = 0.0
+    for epoch in range(config.epochs):
+        train_sampler.set_epoch(epoch)
+        model.train()
+        criterion.train()
 
-    # Optimizer: lower LR on (possibly frozen) backbone
-    bb_params = []
-    head_params = []
-    for n,p in model.named_parameters():
-        if not p.requires_grad: 
-            continue
-        if "backbone" in n:
-            bb_params.append(p)
-        else:
-            head_params.append(p)
-    optim = AdamW([
-        {"params": head_params, "lr": cfg.lr, "weight_decay": cfg.wd},
-        {"params": bb_params, "lr": cfg.lr * cfg.backbone_lr_mult, "weight_decay": cfg.wd},
-    ])
+        pbar = tqdm(train_loader, disable=(rank != 0))
+        epoch_loss = 0.0
 
-    def lr_lambda(ep):
-        if ep < cfg.warmup_epochs:
-            return float(ep + 1) / float(max(1, cfg.warmup_epochs))
-        return 1.0
-    sched = LambdaLR(optim, lr_lambda=lr_lambda)
+        for i, batch in enumerate(pbar):
+            images = batch["images"].to(rank, non_blocking=True)
+            targets = [{k: v.to(rank) for k, v in t.items()} for t in batch["targets"]]
 
-    # AMP
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss_dict = criterion(outputs, targets)
+            losses = sum(loss_dict.values())
 
-    # Wrap DDP
-    if dist.is_initialized():
-        find_unused = cfg.find_unused_params
-        model = DDP(model, device_ids=[local_gpu], output_device=local_gpu, find_unused_parameters=find_unused)
+            losses.backward()
+            optimizer.step()
 
-    best_segm_ap = -1.0
+            epoch_loss += losses.item()
+            if rank == 0:
+                pbar.set_description(f"Epoch [{epoch+1}/{config.epochs}] Loss: {losses.item():.4f}")
 
-    for epoch in range(1, cfg.epochs+1):
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
+        scheduler.step()
 
-        train_stats = train_one_epoch(model, criterion, optim, train_loader, device, epoch, scaler, grad_clip=cfg.grad_clip_norm)
-        sched.step()
+        # Evaluate on Validation Set
+        if rank == 0:
+            eval_results = coco_evaluate(model, val_loader, device=rank)
+            segm_map = eval_results["segm"]["mAP"]
+            bbox_map = eval_results["bbox"]["mAP"]
 
-        # Eval
-        bbox_stats = segm_stats = {"AP": 0.0}
-        if cfg.eval_every_epoch:
-            # model.module if DDP
-            eval_model = model.module if isinstance(model, DDP) else model
-            bbox_stats, segm_stats = evaluate(eval_model, val_loader, device, cfg.val_json)
-
-        # Logging per epoch
-        if is_main_process():
-            log_path = os.path.join(out_logs, f"{epoch}_logs.txt")
+            # Log results
+            log_path = os.path.join("logs", config.experiment_name, f"{epoch+1}_logs.txt")
             with open(log_path, "w") as f:
-                f.write(json.dumps({
-                    "epoch": epoch,
-                    "train": train_stats,
-                    "bbox_eval": bbox_stats,
-                    "segm_eval": segm_stats
-                }, indent=2))
+                f.write(f"Epoch: {epoch+1}\n")
+                f.write(f"Train Loss: {epoch_loss/len(train_loader):.4f}\n")
+                f.write(f"Segm mAP: {segm_map:.4f}\n")
+                f.write(f"BBox mAP: {bbox_map:.4f}\n")
 
-        # Save best checkpoints by segm AP
-        cur_ap = float(segm_stats.get("AP", 0.0))
-        is_best = cur_ap > best_segm_ap
-        if is_main_process() and is_best:
-            best_segm_ap = cur_ap
-            base = os.path.join(out_ckpt, f"{epoch}_{best_segm_ap:.4f}.pt")
-            to_save = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
-            torch.save({
-                "epoch": epoch,
-                "model": to_save,
-                "optimizer": optim.state_dict(),
-                "scheduler": sched.state_dict(),
-                "best_segm_AP": best_segm_ap,
-                "config": cfg.__dict__,
-            }, base)
+            # Save best checkpoint
+            if segm_map > best_map:
+                best_map = segm_map
+                ckpt_path = os.path.join("checkpoints", config.experiment_name)
+                os.makedirs(ckpt_path, exist_ok=True)
+                save_checkpoint(
+                    model.module,
+                    optimizer,
+                    epoch,
+                    segm_map,
+                    ckpt_path
+                )
 
-        # Save visualizations (n samples from *this* epoch's first val batch)
-        if is_main_process():
-            eval_model = model.module if isinstance(model, DDP) else model
-            eval_model.eval()
-            with torch.no_grad():
-                for images, targets in val_loader:
-                    images = images.to(device)
-                    outputs = eval_model(images)
-                    preds = postprocess(outputs, targets)
-                    # format for visualizer
-                    pack = []
-                    for p in preds:
-                        pack.append({
-                            "scores": p["scores"],
-                            "labels": p["labels"],
-                            "masks": p["masks"],  # (Q,H,W)
-                        })
-                    save_visualizations(images, targets, pack, out_viz, epoch, n_limit=cfg.viz_n_per_epoch, score_thresh=cfg.viz_score_thresh)
-                    break  # only one batch per epoch
-            eval_model.train()
+            # Save visualization samples
+            visualizer.save_predictions(model, val_loader, epoch)
 
-    if dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
+    cleanup_ddp()
 
 if __name__ == "__main__":
-    main()
+    config = Config()
+    world_size = torch.cuda.device_count()
+    torch.multiprocessing.spawn(main, args=(world_size, config), nprocs=world_size)
