@@ -46,21 +46,22 @@ class InstanceSegmentationDataset(Dataset):
         labels = []
         
         for ann in anns:
-            if 'bbox' in ann:
+            # Only process annotations that have both bbox and segmentation
+            if 'bbox' in ann and 'segmentation' in ann:
                 x, y, w, h = ann['bbox']
-                boxes.append([x, y, x + w, y + h])
-            
-            if 'segmentation' in ann:
-                if isinstance(ann['segmentation'], dict):
-                    rle = ann['segmentation']
-                    mask = mask_utils.decode(rle)
-                elif isinstance(ann['segmentation'], list):
-                    h, w = image.shape[:2]
-                    rle = mask_utils.frPyObjects(ann['segmentation'], h, w)
-                    mask = mask_utils.decode(mask_utils.merge(rle))
-                masks.append(mask)
-            
-            labels.append(0)  # Single class
+                # Skip invalid boxes
+                if w > 0 and h > 0:
+                    boxes.append([x, y, x + w, y + h])
+                    
+                    if isinstance(ann['segmentation'], dict):
+                        rle = ann['segmentation']
+                        mask = mask_utils.decode(rle)
+                    elif isinstance(ann['segmentation'], list):
+                        h, w = image.shape[:2]
+                        rle = mask_utils.frPyObjects(ann['segmentation'], h, w)
+                        mask = mask_utils.decode(mask_utils.merge(rle))
+                    masks.append(mask)
+                    labels.append(0)  # Single class
         
         if len(boxes) == 0:
             boxes = np.zeros((0, 4), dtype=np.float32)
@@ -72,17 +73,32 @@ class InstanceSegmentationDataset(Dataset):
             labels = np.array(labels, dtype=np.int64)
         
         if self.transforms:
+            # Create a custom label for each mask to track them through augmentation
+            instance_labels = list(range(len(labels)))
+            
             transformed = self.transforms(
                 image=image,
                 masks=list(masks) if len(masks) > 0 else [],
                 bboxes=list(boxes) if len(boxes) > 0 else [],
-                labels=list(labels) if len(labels) > 0 else []
+                labels=instance_labels if len(labels) > 0 else []
             )
             
             image = transformed['image']
-            masks = transformed['masks']
-            boxes = transformed['bboxes']
-            labels = transformed['labels']
+            transformed_masks = transformed['masks']
+            transformed_boxes = transformed['bboxes']
+            transformed_instance_labels = transformed['labels']
+            
+            # Rebuild arrays using only kept instances
+            if len(transformed_instance_labels) > 0:
+                # Use instance labels to match masks with boxes
+                kept_indices = transformed_instance_labels
+                masks = np.array(transformed_masks)
+                boxes = np.array(transformed_boxes)
+                labels = np.array([labels[i] if i < len(labels) else 0 for i in kept_indices])
+            else:
+                masks = np.zeros((0, image.shape[-2], image.shape[-1]), dtype=np.uint8)
+                boxes = np.zeros((0, 4), dtype=np.float32)
+                labels = np.zeros((0,), dtype=np.int64)
         
         target = {
             'boxes': torch.as_tensor(boxes, dtype=torch.float32),
