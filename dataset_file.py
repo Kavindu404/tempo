@@ -8,6 +8,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from pycocotools import mask as mask_utils
 
+
 class MaskBoxSyncTransform:
     """Wrapper to ensure masks and boxes stay synchronized during transforms"""
     def __init__(self, transform):
@@ -26,12 +27,12 @@ class MaskBoxSyncTransform:
                 # More masks than boxes - keep only masks for existing boxes
                 result['masks'] = result['masks'][:num_boxes]
             elif num_boxes > num_masks and num_masks > 0:
-                # More boxes than masks - this shouldn't happen but handle it
-                # Duplicate last mask or create empty ones
+                # More boxes than masks - duplicate last mask
                 while len(result['masks']) < num_boxes:
                     result['masks'].append(result['masks'][-1])
         
         return result
+
 
 class InstanceSegmentationDataset(Dataset):
     def __init__(self, json_path, image_dir, transforms=None, is_train=True):
@@ -115,11 +116,13 @@ class InstanceSegmentationDataset(Dataset):
             
             # Rebuild arrays using only kept instances
             if len(transformed_instance_labels) > 0:
-                # Use instance labels to match masks with boxes
-                kept_indices = transformed_instance_labels
+                # Normalize to flat integer list
+                kept_indices = [int(i) if not isinstance(i, (list, tuple)) else int(i[0]) 
+                                for i in transformed_instance_labels]
+                
                 masks = np.array(transformed_masks)
                 boxes = np.array(transformed_boxes)
-                labels = np.array([labels[i] if i < len(labels) else 0 for i in kept_indices])
+                labels = labels[kept_indices] if len(labels) > 0 else np.zeros((0,), dtype=np.int64)
             else:
                 masks = np.zeros((0, image.shape[-2], image.shape[-1]), dtype=np.uint8)
                 boxes = np.zeros((0, 4), dtype=np.float32)
@@ -127,7 +130,8 @@ class InstanceSegmentationDataset(Dataset):
         
         target = {
             'boxes': torch.as_tensor(boxes, dtype=torch.float32),
-            'masks': torch.as_tensor(masks, dtype=torch.uint8),
+            'masks': torch.stack([torch.as_tensor(m, dtype=torch.uint8) for m in masks]) 
+                      if len(masks) > 0 else torch.zeros((0, image.shape[-2], image.shape[-1]), dtype=torch.uint8),
             'labels': torch.as_tensor(labels, dtype=torch.int64),
             'image_id': torch.tensor([img_id]),
             'orig_size': torch.as_tensor([int(img_info['height']), int(img_info['width'])]),
@@ -136,13 +140,14 @@ class InstanceSegmentationDataset(Dataset):
         
         return image, target
 
+
 def get_transforms(config, is_train=True):
     if is_train:
         transform = A.Compose([
-            A.RandomResizedCrop(config.img_size[0], config.img_size[1], scale=(0.5, 1.0)),
+            A.RandomResizedCrop(config.img_size, scale=(0.5, 1.0)),
             A.HorizontalFlip(p=0.5),
             A.RandomBrightnessContrast(p=0.2),
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.3),
+            A.ColorJitter(p=0.3),
             A.Normalize(mean=config.normalize_mean, std=config.normalize_std),
             ToTensorV2()
         ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']),
@@ -156,6 +161,7 @@ def get_transforms(config, is_train=True):
            additional_targets={'masks': 'masks'})
     
     return transform
+
 
 def collate_fn(batch):
     batch = list(zip(*batch))
