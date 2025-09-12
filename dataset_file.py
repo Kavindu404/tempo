@@ -8,6 +8,31 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from pycocotools import mask as mask_utils
 
+class MaskBoxSyncTransform:
+    """Wrapper to ensure masks and boxes stay synchronized during transforms"""
+    def __init__(self, transform):
+        self.transform = transform
+    
+    def __call__(self, **kwargs):
+        # Apply the transform
+        result = self.transform(**kwargs)
+        
+        # Ensure masks and bboxes have the same count
+        if 'bboxes' in result and 'masks' in result:
+            num_boxes = len(result['bboxes'])
+            num_masks = len(result['masks'])
+            
+            if num_boxes < num_masks:
+                # More masks than boxes - keep only masks for existing boxes
+                result['masks'] = result['masks'][:num_boxes]
+            elif num_boxes > num_masks and num_masks > 0:
+                # More boxes than masks - this shouldn't happen but handle it
+                # Duplicate last mask or create empty ones
+                while len(result['masks']) < num_boxes:
+                    result['masks'].append(result['masks'][-1])
+        
+        return result
+
 class InstanceSegmentationDataset(Dataset):
     def __init__(self, json_path, image_dir, transforms=None, is_train=True):
         self.image_dir = image_dir
