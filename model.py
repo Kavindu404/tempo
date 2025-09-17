@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import copy
-from deformable_attention import MSDeformAttn, get_reference_points
+from deformable_attention import MSDeformAttn
 
 class DINOv3Mask2Former(nn.Module):
     def __init__(self, config):
@@ -76,8 +76,8 @@ class DINOv3Mask2Former(nn.Module):
             if p.dim() > 1 and p.requires_grad:
                 nn.init.xavier_uniform_(p)
         
-        # Class embedding initialization
-        prior_prob = 0.01
+        # Class embedding initialization - less conservative for faster learning
+        prior_prob = 0.1  # Increased from 0.01 for better initial predictions
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         self.class_embed.bias.data = torch.ones(self.config.num_classes + 1) * bias_value
         
@@ -85,9 +85,9 @@ class DINOv3Mask2Former(nn.Module):
         nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
         nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
         
-        # Initialize query embeddings with normal distribution
-        torch.nn.init.normal_(self.query_feat.weight, std=0.01)
-        torch.nn.init.normal_(self.query_embed.weight, std=0.01)
+        # Initialize query embeddings with slightly stronger values
+        torch.nn.init.normal_(self.query_feat.weight, std=0.1)  # Increased from 0.01
+        torch.nn.init.normal_(self.query_embed.weight, std=0.1)  # Increased from 0.01
     
     def _load_dinov3_backbone(self):
         backbone_name = f'dinov3_{self.config.backbone_type}'
@@ -173,18 +173,15 @@ class DINOv3Mask2Former(nn.Module):
         query_feat = query_embeds['content'].unsqueeze(0).repeat(batch_size, 1, 1)
         query_pos = query_embeds['position'].unsqueeze(0).repeat(batch_size, 1, 1)
         
-        # Reference points for deformable attention
-        reference_points = get_reference_points(spatial_shapes, device=src_flatten.device)
-        
         # Decoder forward pass
+        # Note: In deformable attention, we don't need explicit reference points for memory
+        # as the spatial locations are implicit in the flattened multi-scale features
         hs, memory, inter_references = self.decoder(
             query=query_feat,
-            key=src_flatten,
-            value=src_flatten,
+            memory=src_flatten,  # Multi-scale flattened features
             query_pos=query_pos,
-            key_pos=lvl_pos_embed_flatten,
-            key_padding_mask=mask_flatten,
-            reference_points=reference_points,
+            memory_pos=lvl_pos_embed_flatten,  # Positional embeddings for memory
+            memory_padding_mask=mask_flatten,
             spatial_shapes=spatial_shapes
         )
         
@@ -381,40 +378,49 @@ class Mask2FormerDecoder(nn.Module):
         
         self.norm = nn.LayerNorm(d_model)
         
-        # Reference point head
+        # Reference point head for generating query reference points
         self.reference_point_head = MLP(d_model, d_model, 2, 2)
     
-    def forward(self, query, key, value, query_pos, key_pos, key_padding_mask,
-                reference_points, spatial_shapes):
+    def forward(self, query, memory, query_pos, memory_pos, memory_padding_mask,
+                spatial_shapes):
+        """
+        Args:
+            query: query embeddings (B, num_queries, C)
+            memory: flattened multi-scale features (B, H*W, C)
+            query_pos: query positional embeddings (B, num_queries, C)
+            memory_pos: memory positional embeddings (B, H*W, C)
+            memory_padding_mask: padding mask for memory (B, H*W)
+            spatial_shapes: spatial shapes of each feature level (num_levels, 2)
+        """
         output = query
         intermediate = []
         intermediate_ref_points = []
         
         bs = query.shape[0]
         
-        # Initial reference points for queries
+        # Generate initial reference points for queries (where queries should look)
         query_ref_points = self.reference_point_head(query_pos).sigmoid()
         query_ref_points = query_ref_points.unsqueeze(2).repeat(1, 1, self.num_feature_levels, 1)
         
         for layer_idx, layer in enumerate(self.layers):
             output = layer(
-                output, key, value,
+                tgt=output,
+                memory=memory,
                 query_pos=query_pos,
-                key_pos=key_pos,
+                memory_pos=memory_pos,
                 query_ref_points=query_ref_points,
-                key_ref_points=reference_points,
-                key_padding_mask=key_padding_mask,
+                memory_padding_mask=memory_padding_mask,
                 spatial_shapes=spatial_shapes
             )
             
-            # Update reference points
+            # Update reference points based on layer output
             new_query_ref_points = self.reference_point_head(output).sigmoid()
             query_ref_points = new_query_ref_points.unsqueeze(2).repeat(1, 1, self.num_feature_levels, 1)
             
             intermediate.append(self.norm(output))
             intermediate_ref_points.append(query_ref_points)
         
-        return torch.stack(intermediate), key, torch.stack(intermediate_ref_points)
+        return torch.stack(intermediate), memory, torch.stack(intermediate_ref_points)
 
 
 class Mask2FormerDecoderLayer(nn.Module):
@@ -444,22 +450,38 @@ class Mask2FormerDecoderLayer(nn.Module):
     def with_pos_embed(self, tensor, pos):
         return tensor if pos is None else tensor + pos
     
-    def forward(self, tgt, memory, value, query_pos, key_pos, 
-                query_ref_points, key_ref_points, key_padding_mask, spatial_shapes):
+    def forward(self, tgt, memory, query_pos, memory_pos, 
+                query_ref_points, memory_padding_mask, spatial_shapes):
+        """
+        Args:
+            tgt: query embeddings (B, num_queries, C)
+            memory: multi-scale flattened features (B, H*W, C)
+            query_pos: query positional embeddings (B, num_queries, C)
+            memory_pos: memory positional embeddings (B, H*W, C) - not used in deformable attention
+            query_ref_points: reference points for queries (B, num_queries, num_levels, 2)
+            memory_padding_mask: padding mask for memory (B, H*W)
+            spatial_shapes: spatial shapes of each level (num_levels, 2)
+        """
         
         # Self attention with pre-norm
         tgt2 = self.norm1(tgt)
         q = k = self.with_pos_embed(tgt2, query_pos)
-        tgt2, _ = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), 
-                                  tgt2.transpose(0, 1))
+        tgt2, _ = self.self_attn(
+            q.transpose(0, 1), 
+            k.transpose(0, 1), 
+            tgt2.transpose(0, 1)
+        )
         tgt2 = tgt2.transpose(0, 1)
         tgt = tgt + self.dropout1(tgt2)
         
         # Multi-scale deformable cross attention with pre-norm
         tgt2 = self.norm2(tgt)
         tgt2 = self.cross_attn(
-            tgt2, query_ref_points, 
-            memory, spatial_shapes, key_padding_mask
+            query=tgt2,
+            reference_points=query_ref_points,
+            input_flatten=memory,  # Now using memory directly
+            input_spatial_shapes=spatial_shapes,
+            input_padding_mask=memory_padding_mask
         )
         tgt = tgt + self.dropout2(tgt2)
         
