@@ -1,3 +1,123 @@
+
+import os
+import pandas as pd
+from shapely.geometry import Point, shape
+from shapely import wkt
+
+def check_ground_truth(folder1, folder2, excel_file, output_txt):
+    """
+    folder1: path to folder containing {Full Address}.csv files
+    folder2: path to the folder used for false detections
+    excel_file: CSV with columns ['Full Address', 'Ground Truth']
+    output_txt: where to save missing filenames
+    """
+
+    df = pd.read_csv(excel_file)
+
+    # Convert to dictionary for faster lookup
+    gt_map = dict(zip(df['Full Address'], df['Ground Truth']))
+
+    missing_list = []
+
+    for fname in os.listdir(folder1):
+        fpath = os.path.join(folder1, fname)
+
+        # Skip subfolders
+        if not os.path.isfile(fpath):
+            continue
+
+        # Expecting filename format "{Full Address}.csv"
+        if not fname.lower().endswith(".csv"):
+            continue
+
+        full_addr = fname[:-4]  # remove .csv
+
+        # Skip if address not in excel
+        if full_addr not in gt_map:
+            continue
+
+        ground_truth_raw = str(gt_map[full_addr]).strip()
+
+        # -------------------------------
+        # Parse Ground Truth
+        # -------------------------------
+
+        if ground_truth_raw == "?":
+            # No ground truth → skip
+            continue
+
+        # LAT, LON like "(39.35282,-82.52728)"
+        if ground_truth_raw.startswith("(") and ground_truth_raw.endswith(")"):
+            lat, lon = ground_truth_raw[1:-1].split(",")
+            gt_geom = Point(float(lon), float(lat))   # shapely uses (x,y) = (lon,lat)
+
+        # POLYGON or MULTIPOLYGON in WKT
+        elif ground_truth_raw.startswith("POLYGON") or ground_truth_raw.startswith("MULTIPOLYGON"):
+            gt_geom = wkt.loads(ground_truth_raw)
+        else:
+            # Unknown format, skip
+            continue
+
+        # -------------------------------
+        # Load parcel geometry from file
+        # -------------------------------
+
+        try:
+            df_parcel = pd.read_csv(fpath)
+        except Exception as e:
+            print(f"Error reading {fname}: {e}")
+            continue
+
+        if "parcel_geometry" not in df_parcel.columns:
+            print(f"Missing parcel_geometry in {fname}")
+            continue
+
+        parcel_wkt = df_parcel['parcel_geometry'].iloc[0]
+
+        try:
+            parcel_geom = wkt.loads(parcel_wkt)
+        except Exception as e:
+            print(f"Invalid WKT in {fname}: {e}")
+            continue
+
+        # -------------------------------
+        # Check containment
+        # -------------------------------
+
+        try:
+            inside = parcel_geom.contains(gt_geom) or parcel_geom.intersects(gt_geom)
+        except Exception:
+            inside = False
+
+        if inside:
+            # Everything OK
+            continue
+
+        # -------------------------------
+        # If not inside, check folder2
+        # -------------------------------
+
+        alt_path = os.path.join(folder2, fname)
+
+        if os.path.exists(alt_path):
+            # Already identified as wrong → skip recording
+            continue
+
+        # Otherwise add to missing list
+        missing_list.append(fname)
+
+    # -------------------------------
+    # Save missing filenames
+    # -------------------------------
+    with open(output_txt, "w") as f:
+        for item in missing_list:
+            f.write(item + "\n")
+
+    print(f"Done. Missing count: {len(missing_list)}. Saved to {output_txt}.")
+
+
+
+
 import gradio as gr
 import matplotlib.pyplot as plt
 import numpy as np
