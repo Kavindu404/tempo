@@ -1,196 +1,222 @@
-
-import os
 import pandas as pd
-from shapely.geometry import Point, shape
-from shapely import wkt
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+from typing import Optional, Tuple
 
-def check_ground_truth(folder1, folder2, excel_file, output_txt):
+# -------------------------------------------------
+# Assumed to be defined elsewhere and imported:
+# from your_module import ecopia_addr_API
+# def ecopia_addr_API(address: str) -> dict:
+#     ...
+# -------------------------------------------------
+
+
+def build_address(row: pd.Series) -> str:
     """
-    folder1: path to folder containing {Full Address}.csv files
-    folder2: path to the folder used for false detections
-    excel_file: CSV with columns ['Full Address', 'Ground Truth']
-    output_txt: where to save missing filenames
+    Build an address string from the CSV row:
+    "Address1 Address2, City, State ZipCode"
+    Skips empty/NaN parts.
     """
+    parts = []
 
-    df = pd.read_csv(excel_file)
+    for col in ["Address1", "Address2"]:
+        val = row.get(col)
+        if pd.notna(val) and str(val).strip():
+            parts.append(str(val).strip())
 
-    # Convert to dictionary for faster lookup
-    gt_map = dict(zip(df['Full Address'], df['Ground Truth']))
+    street_part = " ".join(parts)
 
-    missing_list = []
+    city = row.get("City")
+    state = row.get("State")
+    zipcode = row.get("ZipCode")
 
-    for fname in os.listdir(folder1):
-        fpath = os.path.join(folder1, fname)
+    city = str(city).strip() if pd.notna(city) else ""
+    state = str(state).strip() if pd.notna(state) else ""
+    zipcode = str(zipcode).strip() if pd.notna(zipcode) else ""
 
-        # Skip subfolders
-        if not os.path.isfile(fpath):
-            continue
+    components = []
+    if street_part:
+        components.append(street_part)
+    if city:
+        components.append(city)
 
-        # Expecting filename format "{Full Address}.csv"
-        if not fname.lower().endswith(".csv"):
-            continue
+    state_zip = " ".join([p for p in [state, zipcode] if p])
+    if state_zip:
+        components.append(state_zip)
 
-        full_addr = fname[:-4]  # remove .csv
-
-        # Skip if address not in excel
-        if full_addr not in gt_map:
-            continue
-
-        ground_truth_raw = str(gt_map[full_addr]).strip()
-
-        # -------------------------------
-        # Parse Ground Truth
-        # -------------------------------
-
-        if ground_truth_raw == "?":
-            # No ground truth → skip
-            continue
-
-        # LAT, LON like "(39.35282,-82.52728)"
-        if ground_truth_raw.startswith("(") and ground_truth_raw.endswith(")"):
-            lat, lon = ground_truth_raw[1:-1].split(",")
-            gt_geom = Point(float(lon), float(lat))   # shapely uses (x,y) = (lon,lat)
-
-        # POLYGON or MULTIPOLYGON in WKT
-        elif ground_truth_raw.startswith("POLYGON") or ground_truth_raw.startswith("MULTIPOLYGON"):
-            gt_geom = wkt.loads(ground_truth_raw)
-        else:
-            # Unknown format, skip
-            continue
-
-        # -------------------------------
-        # Load parcel geometry from file
-        # -------------------------------
-
-        try:
-            df_parcel = pd.read_csv(fpath)
-        except Exception as e:
-            print(f"Error reading {fname}: {e}")
-            continue
-
-        if "parcel_geometry" not in df_parcel.columns:
-            print(f"Missing parcel_geometry in {fname}")
-            continue
-
-        parcel_wkt = df_parcel['parcel_geometry'].iloc[0]
-
-        try:
-            parcel_geom = wkt.loads(parcel_wkt)
-        except Exception as e:
-            print(f"Invalid WKT in {fname}: {e}")
-            continue
-
-        # -------------------------------
-        # Check containment
-        # -------------------------------
-
-        try:
-            inside = parcel_geom.contains(gt_geom) or parcel_geom.intersects(gt_geom)
-        except Exception:
-            inside = False
-
-        if inside:
-            # Everything OK
-            continue
-
-        # -------------------------------
-        # If not inside, check folder2
-        # -------------------------------
-
-        alt_path = os.path.join(folder2, fname)
-
-        if os.path.exists(alt_path):
-            # Already identified as wrong → skip recording
-            continue
-
-        # Otherwise add to missing list
-        missing_list.append(fname)
-
-    # -------------------------------
-    # Save missing filenames
-    # -------------------------------
-    with open(output_txt, "w") as f:
-        for item in missing_list:
-            f.write(item + "\n")
-
-    print(f"Done. Missing count: {len(missing_list)}. Saved to {output_txt}.")
+    return ", ".join(components)
 
 
+def fetch_lat_lon_for_row(
+    idx: int,
+    row: pd.Series,
+) -> Tuple[int, Optional[float], Optional[float]]:
+    """
+    Call ecopia_addr_API for this row and return (index, lat, lon).
+    If lookup fails, lat/lon will be None.
+
+    Expects ecopia_addr_API(address) to return a dict like:
+    {
+        "result": {
+            "format_name": "...",
+            ...
+            "location": {"lat": ..., "lon": ...},
+            ...
+        },
+        "status": True,
+        "version": "4.x.x"
+    }
+    """
+    address = build_address(row)
+
+    try:
+        resp = ecopia_addr_API(address)  # this should already be resp.json()
+
+        if not isinstance(resp, dict):
+            return idx, None, None
+
+        # Check status flag if present
+        if resp.get("status") is False:
+            return idx, None, None
+
+        result = resp.get("result") or {}
+        loc = result.get("location") or {}
+
+        lat = loc.get("lat")
+        lon = loc.get("lon")
+
+        if lat is None or lon is None:
+            return idx, None, None
+
+        # Sanity checks
+        lat = float(lat)
+        lon = float(lon)
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return idx, None, None
+
+        return idx, lat, lon
+
+    except Exception:
+        # You can log the exception here if you want
+        return idx, None, None
 
 
-import gradio as gr
-import matplotlib.pyplot as plt
-import numpy as np
-from skimage import measure
+def sample_25_percent(input_csv_path: Path, random_state: int = 42) -> Path:
+    """
+    Load a CSV, take a 25% random sample, save as *_selected.csv and *_selected.xlsx.
+    Returns the path of the *_selected.csv file.
+    """
+    print(f"\nSampling 25% from: {input_csv_path}")
+    df = pd.read_csv(input_csv_path)
 
-# Example: Create sample data (you'll replace this with your actual image)
-def create_sample_contours():
-    image = np.zeros((100, 100))
-    image[20:40, 20:40] = 1
-    image[60:80, 60:80] = 1
-    image[30:50, 60:75] = 1
-    contours = measure.find_contours(image, level=0.5)
-    return image, contours
+    sampled_df = df.sample(frac=0.25, random_state=random_state)
+    print(f"Original rows: {len(df)}, Sampled rows: {len(sampled_df)}")
 
-# Function to plot a specific contour
-def plot_contour(contour_idx, image, contours):
-    if contours is None or len(contours) == 0:
-        return None
-    
-    # Ensure index is valid
-    contour_idx = int(contour_idx)
-    if contour_idx >= len(contours):
-        contour_idx = len(contours) - 1
-    
-    fig, ax = plt.subplots(figsize=(8, 8))
-    
-    # Plot the image
-    ax.imshow(image, cmap='gray', alpha=0.5)
-    
-    # Plot the selected contour
-    contour = contours[contour_idx]
-    ax.plot(contour[:, 1], contour[:, 0], linewidth=3, color='red')
-    
-    ax.set_title(f'Contour {contour_idx} (Total: {len(contours)} contours)\n'
-                 f'Points in this contour: {len(contour)}')
-    ax.axis('image')
-    
-    plt.tight_layout()
-    return fig
+    selected_csv_path = input_csv_path.with_name(input_csv_path.stem + "_selected.csv")
+    selected_xlsx_path = input_csv_path.with_name(input_csv_path.stem + "_selected.xlsx")
 
-# Create the Gradio interface
-def create_contour_viewer(image, contours):
-    with gr.Blocks() as demo:
-        gr.Markdown("# Contour Viewer")
-        gr.Markdown(f"Total contours found: **{len(contours)}**")
-        
-        with gr.Row():
-            slider = gr.Slider(
-                minimum=0, 
-                maximum=len(contours)-1, 
-                step=1, 
-                value=0, 
-                label="Select Contour Index"
+    sampled_df.to_csv(selected_csv_path, index=False)
+    sampled_df.to_excel(selected_xlsx_path, index=False)
+
+    print(f"Saved sampled CSV to:  {selected_csv_path}")
+    print(f"Saved sampled Excel to:{selected_xlsx_path}")
+
+    return selected_csv_path
+
+
+def geocode_selected_file(selected_csv_path: Path, max_workers: int = 16) -> None:
+    """
+    Load *_selected.csv, geocode rows missing lat/lon using ecopia_addr_API,
+    and save as *_geocoded.csv and *_geocoded.xlsx.
+    """
+    print(f"\nGeocoding file: {selected_csv_path}")
+    df = pd.read_csv(selected_csv_path)
+
+    # Define which rows need geocoding
+    # Adjust condition if you only trust hasLatLon or only NaNs
+    missing_mask = (
+        (df["hasLatLon"] == 0) |
+        (df["Latitude"].isna()) |
+        (df["Longitude"].isna())
+    )
+
+    rows_to_geocode = df[missing_mask]
+
+    print(f"Total rows in selected file: {len(df)}")
+    print(f"Rows missing lat/lon to geocode: {len(rows_to_geocode)}")
+
+    if rows_to_geocode.empty:
+        print("No rows to geocode. Skipping API calls.")
+    else:
+        # Multithreaded calls to ecopia_addr_API
+        futures = []
+        results = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for idx, row in rows_to_geocode.iterrows():
+                fut = executor.submit(fetch_lat_lon_for_row, idx, row)
+                futures.append(fut)
+
+            for fut in tqdm(as_completed(futures),
+                            total=len(futures),
+                            desc=f"Geocoding {selected_csv_path.name}"):
+                results.append(fut.result())
+
+        # Apply results back to df
+        updated_count = 0
+        failed_indices = []
+
+        for idx, lat, lon in results:
+            if lat is not None and lon is not None:
+                df.at[idx, "Latitude"] = lat
+                df.at[idx, "Longitude"] = lon
+                df.at[idx, "hasLatLon"] = 1
+                updated_count += 1
+            else:
+                failed_indices.append(idx)
+
+        print(f"Successfully updated {updated_count} rows.")
+        print(f"Failed to update {len(failed_indices)} rows.")
+
+        # Optional: save failed rows for inspection
+        if failed_indices:
+            failed_path = selected_csv_path.with_name(
+                selected_csv_path.stem + "_geocode_failed.csv"
             )
-        
-        plot_output = gr.Plot()
-        
-        # Update plot when slider changes
-        slider.change(
-            fn=lambda idx: plot_contour(idx, image, contours),
-            inputs=slider,
-            outputs=plot_output
-        )
-        
-        # Initial plot
-        demo.load(
-            fn=lambda: plot_contour(0, image, contours),
-            outputs=plot_output
-        )
-    
-    return demo
+            df.loc[failed_indices].to_csv(failed_path, index=False)
+            print(f"Saved failed rows to: {failed_path}")
 
-# Example usage:
-image, contours = create_sample_contours()
-demo = create_contour_viewer(image, contours)
-demo.launch()
+    # Save the geocoded DataFrame
+    geocoded_csv_path = selected_csv_path.with_name(
+        selected_csv_path.stem + "_geocoded.csv"
+    )
+    geocoded_xlsx_path = selected_csv_path.with_name(
+        selected_csv_path.stem + "_geocoded.xlsx"
+    )
+
+    df.to_csv(geocoded_csv_path, index=False)
+    df.to_excel(geocoded_xlsx_path, index=False)
+
+    print(f"Saved geocoded CSV to:  {geocoded_csv_path}")
+    print(f"Saved geocoded Excel to:{geocoded_xlsx_path}")
+
+
+def main():
+    # 🔧 Put your 3 input CSV paths here
+    INPUT_FILES = [
+        Path("file1.csv"),
+        Path("file2.csv"),
+        Path("file3.csv"),
+    ]
+
+    for csv_path in INPUT_FILES:
+        # Step 1: sample 25% and save *_selected
+        selected_path = sample_25_percent(csv_path, random_state=42)
+
+        # Step 2: geocode the selected file, save *_geocoded
+        geocode_selected_file(selected_path, max_workers=16)
+
+
+if __name__ == "__main__":
+    main()
